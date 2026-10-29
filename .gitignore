@@ -1,3 +1,8 @@
-node_modules/
-.DS_Store
-*.log
+*.o
+*.obj
+*.sym
+*.out
+cave
+do_tests
+puzzle
+broken
