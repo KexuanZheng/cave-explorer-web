@@ -12,7 +12,7 @@ function fresh() {
   run(`
     world = new Array(W * H).fill(0);
     seen = new Array(W * H).fill(false);
-    px = 0; py = 0; pgold = 0; gameOver = false;
+    px = 0; py = 0; pgold = 0; gameOver = false; hasKey = false; goal = null;
     hammerUses = 3; facing = { dx: 1, dy: 0 }; stopSnakeTimer(); stopSnakeTimer();
     lastVault = null;
     seeAround(0, 0);
@@ -40,15 +40,38 @@ check('诱饵离金库有距离', decoyCells.every((i) => {
   return !(x >= vault.box.x0 - 2 && x <= vault.box.x1 + 2 && y >= vault.box.y0 - 2 && y <= vault.box.y1 + 2);
 }));
 
-console.log('[2] 巡逻蛇：按固定时间移动（与玩家走不走无关）');
+console.log('[2] 巡逻节奏：低难度不动，中难度按时间移动');
+run("diffKey = 'low'");
 fresh();
-run('world[5 * W + 5] = 3; startSnakeTimer();'); // 蛇在 (5,5)，启动定时器
-const pos0 = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
-env.advance(1300); // 时间过去，触发蛇的定时器（玩家一步没走）
-const pos1 = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
-check('不按键蛇也会动', pos0 !== pos1, `${pos0} -> ${pos1}`);
+run('world[5 * W + 5] = 3; initSnakeHomes(); startSnakeTimer();');
+const posA = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
+env.advance(3000);
+const posA2 = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
+check('低难度蛇原地不动', posA === posA2, `${posA} -> ${posA2}`);
+run('stopSnakeTimer()');
+
+run("diffKey = 'mid'");
+fresh();
+run('world[5 * W + 5] = 3; initSnakeHomes(); startSnakeTimer();');
+const posB = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
+env.advance(1600);
+const posB2 = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
+check('中难度蛇会动', posB !== posB2, `${posB} -> ${posB2}`);
 check('蛇没有消失', run('world.map(v=>v===3).filter(Boolean).length') === 1);
 run('stopSnakeTimer()');
+
+console.log('[2b] 巡逻范围');
+run("diffKey = 'mid'");
+fresh();
+run('world[10 * W + 10] = 3; initSnakeHomes();');
+let far = 0;
+for (let i = 0; i < 300; i++) {
+  run('stepSnakes()');
+  const pos = run('world.map((v,i)=>v===3?i:-1).filter(i=>i>=0)')[0];
+  const x = pos % W, y = (pos / W) | 0;
+  if (Math.abs(x - 10) + Math.abs(y - 10) > 4) far++;
+}
+check('蛇不会走出巡逻范围（中难度 4 步）', far === 0, String(far));
 
 console.log('[3] 蛇的走位与玩家位置无关');
 function seed(n) {
@@ -74,9 +97,9 @@ run('world[1] = 3; world[2] = 1; world[W + 1] = 1; px = 0; py = 0; stepSnakes();
 check('贴到玩家就判负', run('gameOver') === true);
 
 console.log('[4] 蛇不会走进金库');
+run("diffKey = 'high'");
 fresh();
-const w2 = run('generateWorld(DIFFS.high)');
-run('initWorld()'); // 用真实地图
+run('initWorld()'); // 用真实地图（高难度，蛇会移动）
 let insideVault = 0;
 for (let i = 0; i < 80; i++) {
   press(['d', 's', 'a', 'w'][i % 4]);
@@ -97,6 +120,7 @@ check('不存在静音开关', run('typeof Sfx.toggleMute') === 'undefined');
 check('按键 M 不再触发任何逻辑', (press('m'), run('Sfx.eat(), true')) === true);
 
 console.log('[6] 出生点安全区');
+run("diffKey = 'low'");
 fresh();
 run('world[3] = 3;'); // 蛇在 (3,0)，离出生点 3 格
 let entered = 0;
@@ -139,12 +163,72 @@ check('失败文案会随机变化', loseSeen.size >= 2, `${loseSeen.size} 种`)
 const winSeen = new Set();
 for (let i = 0; i < 40; i++) {
   fresh();
-  run('px = 0; py = 0; pgold = 4; world[1] = 2;');
-  press('d');
+  // 手搭一个 兑奖机(1,0) + 门(2,0) 的场景
+  run('world[1] = 5; world[2] = 6; goal = { machine: 1, door: 2 };');
+  run('px = 0; py = 0; pgold = 5; facing = { dx: 1, dy: 0 };');
+  press('f');   // 兑奖机换钥匙
+  run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+  press('f');   // 开门
   winSeen.add(env.overlayMsg().split('\n')[0]);
 }
 check('胜利文案都来自预置列表', [...winSeen].every((t) => WIN.includes(t)), [...winSeen].join(' | '));
 check('胜利文案会随机变化', winSeen.size >= 2, `${winSeen.size} 种`);
+
+console.log('[8] 兑奖机与门的规则');
+fresh();
+run('world[1] = 5; world[2] = 6; goal = { machine: 1, door: 2 }; px = 0; py = 0; facing = { dx: 1, dy: 0 }; pgold = 3;');
+press('f');
+check('星星不够不给钥匙', run('hasKey') === false);
+run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+press('f');
+check('没钥匙开不了门', run('gameOver') === false);
+run('px = 0; py = 0; facing = { dx: 1, dy: 0 }; pgold = 5;');
+press('f');
+check('星星够了给钥匙', run('hasKey') === true);
+check('消耗 5 颗星星', run('pgold') === 0, String(run('pgold')));
+check('换钥匙本身不算赢', run('gameOver') === false);
+run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+press('f');
+check('有钥匙开门通关', run('gameOver') === true);
+
+console.log('[9] 蛇不会把星星/门围死');
+run("diffKey = 'high'");
+fresh();
+run('world[5 * W + 5] = 2; world[15 * W + 5] = 2;');
+run('world[3 * W + 3] = 3; world[10 * W + 10] = 3;');
+run('initSnakeHomes();');
+let tooClose = 0, goalClose = 0;
+for (let i = 0; i < 400; i++) {
+  run('stepSnakes()');
+  const r = run(`(() => {
+    const gold = [], snakes = [];
+    for (let i = 0; i < W * H; i++) {
+      if (world[i] === 2) gold.push(i);
+      if (world[i] === 3) snakes.push(i);
+    }
+    let bad = 0;
+    for (const a of gold) {
+      for (const b of snakes) {
+        const d = Math.abs((a % W) - (b % W)) + Math.abs(((a / W) | 0) - ((b / W) | 0));
+        if (d <= 2) bad++;
+      }
+    }
+    let badGoal = 0;
+    for (const b of snakes) {
+      const x = b % W, y = (b / W) | 0;
+      for (const g of [GOAL_MACHINE, GOAL_DOOR]) {
+        const gx = g % W, gy = (g / W) | 0;
+        if (Math.abs(x - gx) + Math.abs(y - gy) <= 2) badGoal++;
+      }
+    }
+    return { bad, badGoal };
+  })()`);
+  tooClose += r.bad;
+  goalClose += r.badGoal;
+  if (run('gameOver')) break;
+}
+check('蛇从不进入星星周围 2 格', tooClose === 0, String(tooClose));
+check('蛇从不进入兑奖机/门周围 2 格', goalClose === 0, String(goalClose));
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

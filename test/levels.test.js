@@ -52,7 +52,7 @@ const N = 150;
 for (const key of ['low', 'mid', 'high']) {
   const cfg = run(`DIFFS['${key}']`);
   let noHammer = 0, withHammer = 0, openWrong = 0, outerWrong = 0, goldWrong = 0, goldAdjacent = 0;
-  let notNook = 0, losBad = 0, sectorBad = 0, tooClose = 0;
+  let notNook = 0, losBad = 0, sectorBad = 0, tooClose = 0, nearSnakeStars = 0;
   let minAll = Infinity;
 
   for (let i = 0; i < N; i++) {
@@ -80,6 +80,13 @@ for (const key of ['low', 'mid', 'high']) {
         if (w[ny * W + nx] === 1 || w[ny * W + nx] === 4) n++;
       }
       if (n < 2) notNook++;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          if (Math.abs(dx) + Math.abs(dy) > 2) continue;
+          const nx = x + dx, ny = y + dy;
+          if (ny >= 0 && ny < H && nx >= 0 && nx < W && w[ny * W + nx] === 3) nearSnakeStars++;
+        }
+      }
     }
     const sectorOf = (i) => {
       const x = i % W, y = (i / W) | 0;
@@ -167,6 +174,7 @@ for (const key of ['low', 'mid', 'high']) {
   check('星星总数正确', goldWrong === 0, `${goldWrong} 局数量不对`);
   check('星星之间不相邻', goldAdjacent === 0, `${goldAdjacent} 对相邻`);
   check('明面星星都在墙角', notNook === 0, `${notNook} 颗不在墙角`);
+  check('明面星星周围 2 格内没有蛇', nearSnakeStars === 0, `${nearSnakeStars} 颗离蛇太近`);
   check('同一行/列的星星之间有墙', losBad === 0, `${losBad} 对没墙`);
   check('每颗星在不同象限', sectorBad === 0, `${sectorBad} 局有重复`);
   check('星星之间走路距离 ≥ 6', tooClose === 0, `${tooClose} 对太近`);
@@ -180,6 +188,45 @@ check('低难度金库 1 层', low.vault.layers === 1);
 check('高难度金库 2 层', high.vault.layers === 2);
 check('高难度蛇更多', high.snake > low.snake, `${low.snake} vs ${high.snake}`);
 check('高难度明面星星更少', high.open < low.open, `${low.open} vs ${high.open}`);
+
+console.log('\n[兑奖机与门]');
+let noGoal = 0, unreachable = 0, deadlyGoal = 0, notCorner = 0, farApart = 0, notFixed = 0;
+const N_G = 60;
+for (const key of ['low', 'mid', 'high']) {
+  for (let i = 0; i < N_G; i++) {
+    const r = run(`(() => {
+      const w = generateWorld(DIFFS['${key}']);
+      const reach = new Set(bfsSafe(w).reach);
+      const g = goal;
+      if (!g) return { missing: 1 };
+      const xy = (c) => [c % W, (c / W) | 0];
+      const [mx, my] = xy(g.machine);
+      const [dx, dy] = xy(g.door);
+      return {
+        missing: 0,
+        unreach: (reach.has(g.machine) ? 0 : 1) + (reach.has(g.door) ? 0 : 1),
+        deadly: (isDeadly(w, mx, my) ? 1 : 0) + (isDeadly(w, dx, dy) ? 1 : 0),
+        corner: dx + dy,
+        apart: Math.abs(mx - dx) + Math.abs(my - dy),
+        kinds: (w.filter((v) => v === 5).length === 1 && w.filter((v) => v === 6).length === 1) ? 1 : 0,
+        fixed: (dx === W - 1 && dy === H - 1 && mx === W - 2 && my === H - 1) ? 1 : 0,
+      };
+    })()`);
+    if (r.missing) { noGoal++; continue; }
+    if (r.unreach) unreachable++;
+    if (r.deadly) deadlyGoal++;
+    if (r.corner < 18) notCorner++;
+    if (r.apart > 4) farApart++;
+    if (!r.kinds) noGoal++;
+    if (!r.fixed) notFixed++;
+  }
+}
+check('每局都有兑奖机和门', noGoal === 0, `${noGoal} 局缺失`);
+check('兑奖机与门都能走到（不用砸墙）', unreachable === 0, `${unreachable} 个不到`);
+check('兑奖机与门都不贴蛇', deadlyGoal === 0, `${deadlyGoal} 个危险`);
+check('门在画面右下角', notCorner === 0, `${notCorner} 局太靠左上`);
+check('兑奖机固定在 (18,11)、门固定在 (19,11)', notFixed === 0, `${notFixed} 局位置不对`);
+check('兑奖机就在门附近（≤4 步）', farApart === 0, `${farApart} 局太远`);
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

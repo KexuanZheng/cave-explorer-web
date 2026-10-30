@@ -1,0 +1,1081 @@
+// 定义常量
+const W = 20;
+const H = 12;
+
+const EMPTY = 0;
+const WALL = 1;   // 石墙：任何情况下都过不去
+const GOLD = 2;   // 星星
+const SNAKE = 3;  // 蛇
+const WOOD = 4;   // 木墙：可以用锤子砸开
+
+const VERSION = 'v2.4';
+
+// ===== 难度配置 =====
+// wall: 石墙比例；snake: 蛇的数量；gold: 星星总数；target: 胜利所需；open: 放在明面上的星星
+// vault: 金库房间大小与层数；decoys: 诱饵木墙段数；snakeMs: 蛇每隔多少毫秒移动一格
+const DIFFS = {
+    low:  { name: '低', wall: 0.22, snake: 8,  gold: 6, target: 5, vision: 2, open: 4,
+            vault: { size: 8, layers: 1 }, decoys: 2, snakeMs: 1100 },
+    mid:  { name: '中', wall: 0.24, snake: 12, gold: 6, target: 5, vision: 2, open: 3,
+            vault: { size: 9, layers: 1 }, decoys: 4, snakeMs: 900 },
+    high: { name: '高', wall: 0.24, snake: 16, gold: 6, target: 5, vision: 2, open: 3,
+            vault: { size: 10, layers: 2 }, decoys: 6, snakeMs: 700 },
+};
+let diffKey = 'low';
+let target = DIFFS.low.target;
+
+let world = [];
+let seen = []; // 用来记录哪些格子被点亮了
+let px = 0, py = 0, pgold = 0;
+let gameOver = false;
+
+let hammerUses = 3;              // 锤子剩余次数
+let facing = { dx: 1, dy: 0 };   // 朝向：最近一次按下的方向
+let lastVault = null;            // 最近一次生成的金库信息（调试/测试用）
+
+// ===== 计时器状态 =====
+let started = false;
+let finished = false;
+let startTime = 0;
+let elapsedMs = 0;
+let timerId = null;
+
+// ===== 音效（Web Audio，无需素材文件）=====
+const Sfx = (() => {
+    let ctx = null, noiseBuf = null;
+
+    function ac() {
+        if (ctx) {
+            if (ctx.state === 'suspended') ctx.resume();
+            return ctx;
+        }
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        try { ctx = new AC(); } catch (e) { return null; }
+        return ctx;
+    }
+
+    function envelope(gain, t0, dur, vol) {
+        const g = gain.gain;
+        g.setValueAtTime(0.0001, t0);
+        g.exponentialRampToValueAtTime(Math.max(0.0002, vol), t0 + 0.01);
+        g.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    }
+
+    function tone(freq, dur, type, vol, delay, endFreq) {
+        const c = ac();
+        if (!c) return;
+        const t0 = c.currentTime + (delay || 0);
+        const osc = c.createOscillator();
+        const g = c.createGain();
+        osc.type = type || 'square';
+        osc.frequency.setValueAtTime(freq, t0);
+        if (endFreq) osc.frequency.exponentialRampToValueAtTime(endFreq, t0 + dur);
+        envelope(g, t0, dur, vol);
+        osc.connect(g);
+        g.connect(c.destination);
+        osc.start(t0);
+        osc.stop(t0 + dur + 0.03);
+    }
+
+    function noise(dur, vol) {
+        const c = ac();
+        if (!c) return;
+        if (!noiseBuf) {
+            noiseBuf = c.createBuffer(1, Math.floor(c.sampleRate * 0.4), c.sampleRate);
+            const d = noiseBuf.getChannelData(0);
+            for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+        }
+        const t0 = c.currentTime;
+        const src = c.createBufferSource();
+        src.buffer = noiseBuf;
+        const flt = c.createBiquadFilter();
+        flt.type = 'lowpass';
+        flt.frequency.value = 900;
+        const g = c.createGain();
+        envelope(g, t0, dur, vol);
+        src.connect(flt);
+        flt.connect(g);
+        g.connect(c.destination);
+        src.start(t0);
+        src.stop(t0 + dur + 0.03);
+    }
+
+    // ===== 背景音乐：原创的慢板分解和弦 =====
+    // （风格上参考《For River》那种温柔的钢琴独奏，但旋律是另行写的，不是原曲）
+    const BPM = 70, BEAT = 60 / BPM, BAR = BEAT * 4;
+    const PROG = [
+        { bass: 45, tones: [57, 60, 64, 69], mel: 76 }, // Am
+        { bass: 41, tones: [53, 57, 60, 65], mel: 74 }, // F
+        { bass: 48, tones: [55, 60, 64, 67], mel: 72 }, // C
+        { bass: 43, tones: [55, 59, 62, 67], mel: 71 }, // G
+    ];
+    let musicOn = false, musicTimer = null, musicBar = 0, musicNext = 0;
+    const midi = (n) => 440 * Math.pow(2, (n - 69) / 12);
+
+    function warmNote(c, freq, t, dur, vol) {
+        const osc = c.createOscillator();
+        const g = c.createGain();
+        osc.type = 'triangle';
+        osc.frequency.value = freq;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(vol, t + 0.04);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        osc.connect(g);
+        g.connect(c.destination);
+        osc.start(t);
+        osc.stop(t + dur + 0.05);
+    }
+
+    function scheduleBar(c, t0) {
+        const p = PROG[musicBar % PROG.length];
+        warmNote(c, midi(p.bass), t0, BAR * 0.95, 0.040);          // 低音
+        const pat = [0, 1, 2, 3, 2, 1, 0, 1];
+        for (let i = 0; i < 8; i++) {                               // 分解和弦
+            const n = p.tones[pat[i]] + (i >= 4 ? 12 : 0);
+            warmNote(c, midi(n), t0 + (i * BEAT) / 2, BEAT * 0.9, 0.026);
+        }
+        warmNote(c, midi(p.mel), t0 + BEAT, BEAT * 2.2, 0.032);     // 旋律
+        musicBar++;
+    }
+
+    function startMusic() {
+        const c = ac();
+        if (!c || musicOn) return;
+        musicOn = true;
+        musicBar = 0;
+        musicNext = c.currentTime + 0.3;
+        musicTimer = setInterval(() => {
+            const cc = ac();
+            if (!cc) return;
+            while (musicNext < cc.currentTime + 1.2) {
+                scheduleBar(cc, musicNext);
+                musicNext += BAR;
+            }
+        }, 250);
+    }
+
+    return {
+        // 浏览器要求先有用户操作才能出声：第一次按键时调用
+        unlock() { ac(); startMusic(); },
+        eat() { tone(880, 0.08, 'square', 0.12); tone(1320, 0.09, 'square', 0.10, 0.06); },
+        breakWall() { noise(0.14, 0.30); tone(150, 0.12, 'sawtooth', 0.16, 0, 60); },
+        win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'triangle', 0.16, i * 0.12)); },
+        lose() { [392, 330, 262, 196].forEach((f, i) => tone(f, 0.2, 'sawtooth', 0.14, i * 0.13)); },
+    };
+})();
+
+// ===== 基础工具 =====
+const idx = (x, y) => y * W + x;
+const inb = (x, y) => x >= 0 && x < W && y >= 0 && y < H;
+const isSnake = (w, x, y) => inb(x, y) && w[idx(x, y)] === SNAKE;
+const isBlocked = (w, x, y) => inb(x, y) && (w[idx(x, y)] === WALL || w[idx(x, y)] === WOOD);
+
+// 站上去会死的格子：本身是蛇，或四邻有蛇
+function isDeadly(w, x, y) {
+    return isSnake(w, x, y) || isSnake(w, x - 1, y) || isSnake(w, x + 1, y) ||
+           isSnake(w, x, y - 1) || isSnake(w, x, y + 1);
+}
+
+// 出生点附近（2×2 角落）不放墙和蛇
+const nearSpawn = (x, y) => x <= 1 && y <= 1;
+
+// 从出生点出发，沿"可安全站立"的格子 BFS（石墙、木墙都挡住）
+function bfsSafe(w) {
+    const visited = new Array(W * H).fill(false);
+    const dist = new Array(W * H).fill(-1);
+    const q = [0];
+    visited[0] = true;
+    dist[0] = 0;
+    const reach = [];
+    while (q.length) {
+        const i = q.shift();
+        reach.push(i);
+        const x = i % W, y = (i / W) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nx = x + dx, ny = y + dy;
+            if (!inb(nx, ny)) continue;
+            const ni = idx(nx, ny);
+            if (visited[ni] || w[ni] === WALL || w[ni] === WOOD || w[ni] === SNAKE) continue;
+            if (isDeadly(w, nx, ny)) continue;
+            visited[ni] = true;
+            dist[ni] = dist[i] + 1;
+            q.push(ni);
+        }
+    }
+    return { reach, dist };
+}
+
+function randEmpty(w, ok) {
+    for (let t = 0; t < 400; t++) {
+        const loc = Math.floor(Math.random() * (W * H));
+        const x = loc % W, y = (loc / W) | 0;
+        if (w[loc] === EMPTY && ok(x, y)) return loc;
+    }
+    return -1;
+}
+
+function shuffle(a) {
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+// ===== 金库：用木墙围起来的房间 =====
+// 先随机长出一个不规则形状的"房间"，再沿房间边缘铺木墙；layers=2 时外面再套一圈
+function randomBlob(size, margin) {
+    for (let attempt = 0; attempt < 80; attempt++) {
+        const sx = margin + Math.floor(Math.random() * (W - 2 * margin));
+        const sy = margin + Math.floor(Math.random() * (H - 2 * margin));
+
+        const cells = new Set([idx(sx, sy)]);
+        const frontier = [[sx + 1, sy], [sx - 1, sy], [sx, sy + 1], [sx, sy - 1]];
+
+        while (cells.size < size && frontier.length) {
+            const k = Math.floor(Math.random() * frontier.length);
+            const [x, y] = frontier.splice(k, 1)[0];
+            if (x < margin || x > W - 1 - margin || y < margin || y > H - 1 - margin) continue;
+            const i = idx(x, y);
+            if (cells.has(i)) continue;
+            cells.add(i);
+            frontier.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+        }
+        if (cells.size >= size) return [...cells];
+    }
+    return null;
+}
+
+// 求一组格子的四邻边界；如果贴到地图边界则返回 null（墙圈会漏）
+function borderOf(cellsSet) {
+    const out = new Set();
+    for (const c of cellsSet) {
+        const x = c % W, y = (c / W) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nx = x + dx, ny = y + dy;
+            if (!inb(nx, ny)) return null;
+            const ni = idx(nx, ny);
+            if (!cellsSet.has(ni)) out.add(ni);
+        }
+    }
+    return out;
+}
+
+function carveVault(w, v) {
+    const layers = v.layers;
+    const margin = layers === 2 ? 3 : 2;
+
+    for (let attempt = 0; attempt < 60; attempt++) {
+        const blob = randomBlob(v.size, margin);
+        if (!blob) continue;
+        const inBlob = new Set(blob);
+
+        // 内圈木墙
+        const ring1 = borderOf(inBlob);
+        if (!ring1) continue;
+
+        // 双层：中间留一圈走廊，外面再围一圈木墙
+        let gap = null, ring2 = null;
+        if (layers === 2) {
+            const around = borderOf(new Set([...inBlob, ...ring1]));
+            if (!around) continue;
+            gap = new Set([...around].filter((c) => !inBlob.has(c) && !ring1.has(c)));
+            const around2 = borderOf(new Set([...inBlob, ...ring1, ...gap]));
+            if (!around2) continue;
+            ring2 = new Set([...around2].filter((c) => !inBlob.has(c) && !ring1.has(c) && !gap.has(c)));
+        }
+
+        // 不能压到出生点要清空的三格，否则可能被"清"出缺口
+        const spawnCells = [0, 1, W];
+        if ([...ring1].some((c) => spawnCells.includes(c))) continue;
+        if (ring2 && [...ring2].some((c) => spawnCells.includes(c))) continue;
+
+        // 落笔
+        for (const c of blob) w[c] = EMPTY;
+        if (gap) for (const c of gap) w[c] = EMPTY;
+        for (const c of ring1) w[c] = WOOD;
+        if (ring2) for (const c of ring2) w[c] = WOOD;
+
+        const rings = layers === 2 ? [[...ring2], [...ring1]] : [[...ring1]];
+        const all = [...blob, ...ring1, ...(ring2 ? [...ring2] : [])];
+        const xs = all.map((c) => c % W), ys = all.map((c) => (c / W) | 0);
+        const box = {
+            x0: Math.min(...xs), y0: Math.min(...ys),
+            x1: Math.max(...xs), y1: Math.max(...ys),
+        };
+
+        return { interior: blob, rings, box, layers };
+    }
+    return null;
+}
+
+const inVaultBox = (v, x, y, pad) =>
+    v && x >= v.box.x0 - pad && x <= v.box.x1 + pad && y >= v.box.y0 - pad && y <= v.box.y1 + pad;
+
+// 最外层木墙是否紧挨着玩家能走到的区域
+function ringTouchesReach(w, v, reachSet) {
+    for (const c of v.rings[0]) {
+        const x = c % W, y = (c / W) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            if (reachSet.has(idx(x + dx, y + dy))) return true;
+        }
+    }
+    return false;
+}
+
+// 把所有木墙打开后，金库内部是否连通
+function interiorReachable(w, v) {
+    const test = w.slice();
+    for (const ring of v.rings) for (const c of ring) test[c] = EMPTY;
+    const r = bfsSafe(test);
+    return v.interior.every((i) => r.reach.includes(i));
+}
+
+// ===== 诱饵木墙：看起来和金库的木墙一样，砸了却什么也没有 =====
+function placeDecoys(w, vault, count) {
+    let placed = 0;
+    for (let t = 0; t < 300 && placed < count; t++) {
+        const loc = randEmpty(w, (x, y) => !nearSpawn(x, y) && !inVaultBox(vault, x, y, 2));
+        if (loc < 0) break;
+
+        const horizontal = Math.random() < 0.5;
+        const len = 2 + Math.floor(Math.random() * 3); // 2~4 格
+        const x0 = loc % W, y0 = (loc / W) | 0;
+
+        const cells = [];
+        for (let k = 0; k < len; k++) {
+            const x = horizontal ? x0 + k : x0;
+            const y = horizontal ? y0 : y0 + k;
+            if (!inb(x, y)) break;
+            if (nearSpawn(x, y) || inVaultBox(vault, x, y, 2)) break;
+            if (w[idx(x, y)] !== EMPTY) break;
+            cells.push(idx(x, y));
+        }
+        if (cells.length < 2) continue;
+        for (const c of cells) w[c] = WOOD;
+        placed++;
+    }
+}
+
+// 从候选格子里挑 count 个，彼此曼哈顿距离至少 minDist；挑不出就换个顺序重试
+function pickSpread(pool, count, minDist) {
+    for (let attempt = 0; attempt < 80; attempt++) {
+        const chosen = [];
+        for (const c of shuffle(pool.slice())) {
+            if (chosen.length >= count) break;
+            const x = c % W, y = (c / W) | 0;
+            let ok = true;
+            for (const o of chosen) {
+                const ox = o % W, oy = (o / W) | 0;
+                if (Math.abs(x - ox) + Math.abs(y - oy) < minDist) { ok = false; break; }
+            }
+            if (ok) chosen.push(c);
+        }
+        if (chosen.length >= count) return chosen.slice(0, count);
+    }
+    return null;
+}
+
+// 一格四周有几面是墙（越界也算墙）
+function nookSides(w, i) {
+    const x = i % W, y = (i / W) | 0;
+    let n = 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (!inb(nx, ny)) { n++; continue; }
+        const v = w[idx(nx, ny)];
+        if (v === WALL || v === WOOD) n++;
+    }
+    return n;
+}
+
+// 两点之间（同一行/列）是否被墙挡住
+function hasWallBetween(w, a, b) {
+    const ax = a % W, ay = (a / W) | 0, bx = b % W, by = (b / W) | 0;
+    if (ax === bx) {
+        const y0 = Math.min(ay, by), y1 = Math.max(ay, by);
+        for (let y = y0 + 1; y < y1; y++) {
+            const v = w[idx(ax, y)];
+            if (v === WALL || v === WOOD) return true;
+        }
+        return false;
+    }
+    if (ay === by) {
+        const x0 = Math.min(ax, bx), x1 = Math.max(ax, bx);
+        for (let x = x0 + 1; x < x1; x++) {
+            const v = w[idx(x, ay)];
+            if (v === WALL || v === WOOD) return true;
+        }
+        return false;
+    }
+    return true; // 不同行也不同列，本来就不通视
+}
+
+// 从某一格出发，在"能安全站立"的格子上做 BFS，返回距离表（-1 = 到不了）
+function bfsDist(w, start) {
+    const dist = new Array(W * H).fill(-1);
+    const q = [start];
+    dist[start] = 0;
+    while (q.length) {
+        const i = q.shift();
+        const x = i % W, y = (i / W) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nx = x + dx, ny = y + dy;
+            if (!inb(nx, ny)) continue;
+            const ni = idx(nx, ny);
+            if (dist[ni] !== -1) continue;
+            if (w[ni] === WALL || w[ni] === WOOD || w[ni] === SNAKE) continue;
+            if (isDeadly(w, nx, ny)) continue;
+            dist[ni] = dist[i] + 1;
+            q.push(ni);
+        }
+    }
+    return dist;
+}
+
+// 明面星星的摆放：
+//   1) 每颗星必须落在不同的"象限"（地图 2×2 分区），保证玩家要跑遍地图；
+//   2) 必须藏在墙角（至少两面是墙）；
+//   3) 用"图上最远点"策略：每颗新星都尽量离已有星星远（按真实走路步数，而不是直线距离）；
+//   4) 同一行/列时中间必须有墙；且两两走路距离 ≥ 6 步。
+function pickOpenStars(w, pool, count) {
+    if (pool.length < count) return null;
+
+    const sectorOf = (i) => {
+        const x = i % W, y = (i / W) | 0;
+        return (x < W / 2 ? 0 : 1) + (y < H / 2 ? 0 : 2);
+    };
+
+    const bySector = new Map();
+    for (const c of pool) {
+        const s = sectorOf(c);
+        if (!bySector.has(s)) bySector.set(s, []);
+        bySector.get(s).push(c);
+    }
+    const sectors = shuffle([...bySector.keys()]);
+    if (sectors.length < count) return null;
+
+    const chosen = [];
+    const distMaps = [];   // 每颗已选星星的 BFS 距离表
+    const minToChosen = (c) => {
+        let m = Infinity;
+        for (const d of distMaps) if (d[c] >= 0) m = Math.min(m, d[c]);
+        return m;
+    };
+
+    for (let k = 0; k < count; k++) {
+        const cands = shuffle(bySector.get(sectors[k]).slice());
+        let best = -1, bestScore = -1;
+
+        for (const c of cands) {
+            let ok = true;
+            for (const o of chosen) {
+                const ax = c % W, ay = (c / W) | 0;
+                const bx = o % W, by = (o / W) | 0;
+                if ((ax === bx || ay === by) && !hasWallBetween(w, c, o)) { ok = false; break; }
+            }
+            if (!ok) continue;
+
+            const score = chosen.length === 0 ? 0 : minToChosen(c);
+            if (score > bestScore) { bestScore = score; best = c; }
+        }
+
+        if (best < 0) return null;
+        if (chosen.length > 0 && bestScore < 6) return null; // 两颗星挨得太近，整张图重来
+
+        chosen.push(best);
+        distMaps.push(bfsDist(w, best));
+    }
+    return chosen;
+}
+
+// ===== 生成一局 =====
+function generateWorld(cfg) {
+    lastVault = null;
+    for (let attempt = 0; attempt < 300; attempt++) {
+        const w = new Array(W * H).fill(EMPTY);
+
+        // 石墙
+        const nWall = Math.round(W * H * cfg.wall);
+        for (let i = 0; i < nWall; i++) {
+            const loc = randEmpty(w, (x, y) => !nearSpawn(x, y));
+            if (loc >= 0) w[loc] = WALL;
+        }
+
+        // 金库
+        const vault = carveVault(w, cfg.vault);
+        if (!vault) continue;
+
+        // 诱饵木墙
+        placeDecoys(w, vault, cfg.decoys);
+
+        // 蛇（避开金库周边，免得金库没法靠近）
+        for (let i = 0; i < cfg.snake; i++) {
+            const loc = randEmpty(w, (x, y) => !inSpawnSafeZone(x, y) && !inVaultBox(vault, x, y, 2));
+            if (loc >= 0) w[loc] = SNAKE;
+        }
+
+        const { reach, dist } = bfsSafe(w);
+        const reachSet = new Set(reach);
+        if (reach.length < cfg.open + 8) continue;
+        if (!ringTouchesReach(w, vault, reachSet)) continue;
+        if (!interiorReachable(w, vault)) continue;
+
+        // 明面上的星星：每颗落在不同象限、藏在墙角、彼此隔着墙且走路距离够远
+        const openPool = reach.filter((i) => i !== 0 && i !== 1 && i !== W &&
+            dist[i] >= 5 && !inVaultBox(vault, i % W, (i / W) | 0, 0) &&
+            nookSides(w, i) >= 2);
+        if (openPool.length < cfg.open) continue;
+        const openCells = pickOpenStars(w, openPool, cfg.open);
+        if (!openCells) continue;
+        for (const c of openCells) w[c] = GOLD;
+
+        // 金库里的星星：至少隔 2 步
+        const vaultGold = cfg.gold - cfg.open;
+        const vaultPool = vault.interior.filter((i) => w[i] === EMPTY);
+        if (vaultPool.length < vaultGold) continue;
+        const vaultCells = pickSpread(vaultPool, vaultGold, 2);
+        if (!vaultCells) continue;
+        for (const c of vaultCells) w[c] = GOLD;
+
+        lastVault = vault;
+        return w;
+    }
+
+    // 兜底：空旷地图 + 一个简单金库
+    const w = new Array(W * H).fill(EMPTY);
+    for (let x = 0; x < W; x++) { w[idx(x, 2)] = WOOD; w[idx(x, 8)] = WOOD; }
+    for (let y = 2; y <= 8; y++) { w[idx(2, y)] = WOOD; w[idx(17, y)] = WOOD; }
+    for (let i = 0; i < cfg.gold; i++) w[idx(5 + i * 2, 5)] = GOLD;
+    return w;
+}
+
+// 初始化世界
+function initWorld() {
+    const cfg = DIFFS[diffKey];
+    target = cfg.target;
+    hammerUses = 3;
+    world = generateWorld(cfg);
+    seen = new Array(W * H).fill(false);
+
+    // 清出生点
+    world[0] = EMPTY; world[1] = EMPTY; world[W] = EMPTY;
+    px = 0; py = 0; pgold = 0; gameOver = false;
+    facing = { dx: 1, dy: 0 };
+
+    seeAround(px, py);
+    startSnakeTimer();
+}
+
+function seeAround(cx, cy) {
+    const r = DIFFS[diffKey].vision;
+    for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+            const nx = cx + dx, ny = cy + dy;
+            if (inb(nx, ny)) seen[ny * W + nx] = true;
+        }
+    }
+}
+
+// ===== 巡逻蛇：按固定时间自己走，走位与玩家位置无关 =====
+// （蛇不会主动躲玩家；它正好走到玩家身上/身边，就算被咬）
+let snakeTimerId = null;
+
+function startSnakeTimer() {
+    stopSnakeTimer();
+    const ms = DIFFS[diffKey].snakeMs || 900;
+    snakeTimerId = setInterval(() => {
+        if (gameOver) return;
+        stepSnakes();
+        render();
+    }, ms);
+}
+
+function stopSnakeTimer() {
+    if (snakeTimerId) { clearInterval(snakeTimerId); snakeTimerId = null; }
+}
+
+// 出生点安全区：蛇不会进入这片区域，玩家站在出生点上一定安全
+const SPAWN_SAFE_R = 2;
+const inSpawnSafeZone = (x, y) => x <= SPAWN_SAFE_R && y <= SPAWN_SAFE_R;
+
+function isSnakeAdjacent() {
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = px + dx, ny = py + dy;
+        if (inb(nx, ny) && world[idx(nx, ny)] === SNAKE) return true;
+    }
+    return false;
+}
+
+function stepSnakes() {
+    const cells = [];
+    for (let i = 0; i < W * H; i++) if (world[i] === SNAKE) cells.push(i);
+    let moved = 0;
+
+    for (const i of cells) {
+        if (world[i] !== SNAKE) continue;
+        const x = i % W, y = (i / W) | 0;
+        const dirs = shuffle([[1, 0], [-1, 0], [0, 1], [0, -1]]);
+        for (const [dx, dy] of dirs) {
+            const nx = x + dx, ny = y + dy;
+            if (!inb(nx, ny)) continue;
+            const ni = idx(nx, ny);
+            if (world[ni] !== EMPTY) continue;                         // 墙/木墙/金币/其它蛇
+            if (lastVault && inVaultBox(lastVault, nx, ny, 0)) continue; // 不进金库
+            if (inSpawnSafeZone(nx, ny)) continue;                     // 不靠近出生点
+            world[i] = EMPTY;
+            world[ni] = SNAKE;
+            moved++;
+            break;
+        }
+    }
+
+    // 走位与玩家无关：蛇正好压到或贴到玩家，就算被咬
+    if (!gameOver && (world[idx(px, py)] === SNAKE || isSnakeAdjacent())) {
+        die();
+    }
+    return moved;
+}
+
+// ===== 锤子 =====
+function useHammer() {
+    if (gameOver) return;
+    if (hammerUses <= 0) { flashMsg("锤子用完了"); return; }
+
+    let targetCell = -1;
+    const fx = px + facing.dx, fy = py + facing.dy;
+    if (inb(fx, fy) && world[idx(fx, fy)] === WOOD) {
+        targetCell = idx(fx, fy);
+    } else {
+        const cand = [];
+        for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
+            const nx = px + dx, ny = py + dy;
+            if (inb(nx, ny) && world[idx(nx, ny)] === WOOD) cand.push(idx(nx, ny));
+        }
+        if (cand.length === 1) targetCell = cand[0];
+    }
+
+    if (targetCell < 0) { flashMsg("面前没有木墙（先用方向键朝向它）"); return; }
+
+    world[targetCell] = EMPTY;
+    hammerUses--;
+    Sfx.breakWall();
+    seeAround(px, py);
+    render();
+    checkStuck();
+}
+
+// 底部提示
+let flashTimer = null;
+function flashMsg(text) {
+    const el = document.getElementById('flash');
+    if (!el) return;
+    el.textContent = text;
+    el.style.opacity = '1';
+    if (flashTimer) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => { el.style.opacity = '0'; }, 1800);
+}
+
+// ===== 计时功能 =====
+function formatTime(ms) {
+    const v = Math.max(0, ms);
+    const sec = v / 1000;
+    if (sec < 60) return sec.toFixed(1) + " s";
+    const m = Math.floor(sec / 60);
+    const s = sec - m * 60;
+    return m + ":" + (s < 10 ? "0" : "") + s.toFixed(1);
+}
+
+function currentElapsed() {
+    return (started && !finished) ? performance.now() - startTime : elapsedMs;
+}
+
+function updateTimerDisplay() {
+    const el = document.getElementById('timer');
+    if (el) el.textContent = formatTime(currentElapsed());
+}
+
+function startTimer() {
+    if (started) return;
+    started = true;
+    finished = false;
+    startTime = performance.now();
+    elapsedMs = 0;
+    if (timerId) clearInterval(timerId);
+    timerId = setInterval(updateTimerDisplay, 50);
+    updateTimerDisplay();
+}
+
+function stopTimer() {
+    if (!started) {
+        started = true;
+        elapsedMs = 0;
+    } else if (!finished) {
+        elapsedMs = performance.now() - startTime;
+    }
+    finished = true;
+    if (timerId) { clearInterval(timerId); timerId = null; }
+    updateTimerDisplay();
+}
+
+function resetTimer() {
+    started = false;
+    finished = false;
+    startTime = 0;
+    elapsedMs = 0;
+    if (timerId) { clearInterval(timerId); timerId = null; }
+    updateTimerDisplay();
+}
+
+// ===== 结算界面 =====
+function showOverlay(kind, title, msg) {
+    const ov = document.getElementById('overlay');
+    const t = document.getElementById('overlay-title');
+    const m = document.getElementById('overlay-msg');
+    if (!ov || !t || !m) return;
+    t.textContent = title;
+    m.textContent = msg;
+    ov.className = 'overlay ' + kind;
+    ov.style.display = 'flex';
+}
+
+function hideOverlay() {
+    const ov = document.getElementById('overlay');
+    if (ov) ov.style.display = 'none';
+}
+
+function newGame() {
+    hideOverlay();
+    resetTimer();
+    initWorld();
+    render();
+}
+
+function setDifficulty(key) {
+    if (!DIFFS[key]) return;
+    diffKey = key;
+    newGame();
+}
+
+// 从当前位置出发，不砸墙还能拿到几颗星星
+function countReachableGold(sx, sy) {
+    const visited = new Array(W * H).fill(false);
+    const q = [idx(sx, sy)];
+    visited[q[0]] = true;
+    let gold = 0;
+    while (q.length) {
+        const i = q.shift();
+        if (world[i] === GOLD) gold++;
+        const x = i % W, y = (i / W) | 0;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nx = x + dx, ny = y + dy;
+            if (!inb(nx, ny)) continue;
+            const ni = idx(nx, ny);
+            if (visited[ni]) continue;
+            if (world[ni] === WALL || world[ni] === WOOD || world[ni] === SNAKE) continue;
+            if (isDeadly(world, nx, ny)) continue;
+            visited[ni] = true;
+            q.push(ni);
+        }
+    }
+    return gold;
+}
+
+// 锤子用完后，如果剩下的星星已经拿不到，直接判负
+function checkStuck() {
+    if (gameOver || hammerUses > 0) return false;
+    if (pgold + countReachableGold(px, py) >= target) return false;
+    gameOver = true;
+    stopTimer();
+    stopSnakeTimer();
+    Sfx.lose();
+    showOverlay('lose', "⛏️ 锤子用完了",
+        "剩下的星星都被木墙封住了，这一局已经无法通关。按 R 再来一局。");
+    return true;
+}
+
+// ===== 移动 =====
+function tryMove(dx, dy) {
+    // 先记朝向：即使被墙挡住没走动，按 F 也能砸面前那块木墙
+    facing = { dx, dy };
+    const nx = px + dx, ny = py + dy;
+    if (!inb(nx, ny)) return 0;
+    if (world[idx(nx, ny)] === WALL || world[idx(nx, ny)] === WOOD) return 0;
+    px = nx; py = ny;
+    return checkNewMove();
+}
+
+// ===== 结算文案（每次随机一条）=====
+const LOSE_TEXTS = [
+    "这里没有解毒血清。",
+    "小蛇吃掉了你...或许会长成大蛇。",
+    "被咬这一口好疼...但是马上就再也不会疼了。",
+    "被一口吞掉...这条蛇现在看上去像一顶帽子！",
+];
+const WIN_TEXTS = [
+    "轻而易举...对你来说。",
+    "获得成就：星星收藏家！",
+    "你赢了！只有蛇不高兴，蛇觉得饿。",
+    "五颗星星，逃离这里，交易成功！",
+];
+
+function pickText(list) {
+    return list[Math.floor(Math.random() * list.length)];
+}
+
+function die() {
+    gameOver = true;
+    stopTimer();
+    stopSnakeTimer();
+    Sfx.lose();
+    showOverlay('lose', "💀 你被蛇咬死了",
+        pickText(LOSE_TEXTS) + "\n难度 " + DIFFS[diffKey].name + " · 用时 " + formatTime(elapsedMs) + " · 按 R 再来一局。");
+}
+
+function checkNewMove() {
+    const currentLoc = py * W + px;
+
+    // 踩到蛇：死
+    if (world[currentLoc] === SNAKE) { die(); return 3; }
+
+    // 吃到星星
+    if (world[currentLoc] === GOLD) {
+        world[currentLoc] = EMPTY;
+        pgold++;
+        Sfx.eat();
+        if (pgold >= target) {
+            gameOver = true;
+            stopTimer();
+            stopSnakeTimer();
+            Sfx.win();
+            showOverlay('win', "🎉 恭喜通关！",
+                pickText(WIN_TEXTS) + "\n难度 " + DIFFS[diffKey].name + " · 收集 " + target + " 颗星星 · 用时 " + formatTime(elapsedMs) + "。");
+            return 2;
+        }
+    }
+
+    // 四邻有蛇：死
+    for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const nx = px + dx, ny = py + dy;
+        if (inb(nx, ny) && world[ny * W + nx] === SNAKE) { die(); return 3; }
+    }
+
+    if (checkStuck()) return 4;
+    return 1;
+}
+
+// 键盘：WASD 移动；F 砸木墙；1/2/3 切换难度；结束后 R 重开
+window.addEventListener('keydown', (e) => {
+    Sfx.unlock();
+    const key = e.key.toLowerCase();
+
+    if (key === '1') { setDifficulty('low'); return; }
+    if (key === '2') { setDifficulty('mid'); return; }
+    if (key === '3') { setDifficulty('high'); return; }
+
+    if (key === 'r') {
+        if (gameOver) newGame();
+        return;
+    }
+
+    if (gameOver) return;
+
+    if (key === 'f') { useHammer(); return; }
+
+    const ox = px, oy = py;
+    switch (key) {
+        case 'w': tryMove(0, -1); break;
+        case 'a': tryMove(-1, 0); break;
+        case 's': tryMove(0, 1); break;
+        case 'd': tryMove(1, 0); break;
+        default: return;
+    }
+
+    const moved = (px !== ox || py !== oy);
+    if (moved) lastMoveAt = performance.now();
+    if (moved && !started) startTimer();
+
+    seeAround(px, py);
+    render();
+});
+
+function updateHUD() {
+    const g = document.getElementById('gold');
+    if (g) g.innerText = pgold;
+    const t = document.getElementById('target');
+    if (t) t.textContent = target;
+    const d = document.getElementById('diff');
+    if (d) d.textContent = DIFFS[diffKey].name;
+    const hm = document.getElementById('hammer');
+    if (hm) hm.textContent = hammerUses;
+    const v = document.getElementById('ver');
+    if (v) v.textContent = VERSION;
+    ['low', 'mid', 'high'].forEach((k) => {
+        const b = document.getElementById('btn-' + k);
+        if (b) b.className = 'diff-btn' + (k === diffKey ? ' active' : '');
+    });
+}
+
+// ===== 玩家小人（SVG，金发小孩 + 收集星星的瓶子）=====
+// 朝向由 facing 决定；刚走过路时加 .walking 类，触发摆手摆腿动画
+let lastMoveAt = -9999;
+
+function facingDir() {
+    if (facing.dx > 0) return 'right';
+    if (facing.dx < 0) return 'left';
+    if (facing.dy < 0) return 'up';
+    return 'down';
+}
+
+// 玻璃瓶 + 瓶里的星星
+function bottleSVG(x, y) {
+    return '<g class="bottle">' +
+        '<rect x="' + x + '" y="' + y + '" width="3.8" height="5.2" rx="1.1" fill="#dceeff" stroke="#7fa8cc" stroke-width="0.7"/>' +
+        '<rect x="' + (x + 1.2) + '" y="' + (y - 1.2) + '" width="1.4" height="1.4" rx="0.45" fill="#9cc4e4"/>' +
+        '<path d="M' + (x + 1.9) + ' ' + (y + 1.5) + ' l0.68 1.36 1.5 0.22 -1.08 1.06 0.25 1.5 -1.35 -0.71 -1.35 0.71 0.25 -1.5 -1.08 -1.06 1.5 -0.22z" fill="#ffd54f" stroke="#e0a800" stroke-width="0.3"/>' +
+        '</g>';
+}
+
+function shoe(a) {
+    return '<rect x="' + (a - 0.4) + '" y="26.9" width="3.7" height="1.7" rx="0.85" fill="#3b2a1e"/>';
+}
+
+// 小王子配色：金发 + 绿外套 + 金领口 + 红围巾
+const C = {
+    hair: '#f2c94c',
+    hairDark: '#e0b03a',
+    skin: '#f6d0a8',
+    coat: '#3d8b63',
+    coatDark: '#2f6b4a',
+    gold: '#e9c46a',
+    scarf: '#c0392b',
+    eye: '#3a2a1a',
+};
+
+function playerSVG() {
+    const dir = facingDir();
+    const walking = (performance.now() - lastMoveAt) < 220;
+    const shadow = '<ellipse cx="15" cy="28.9" rx="4.4" ry="1" fill="#000" opacity="0.35"/>';
+    const legs = (a, b) =>
+        '<g class="leg leg-l"><rect x="' + a + '" y="22.2" width="2.9" height="5.1" rx="1.2" fill="' + C.coatDark + '"/>' + shoe(a) + '</g>' +
+        '<g class="leg leg-r"><rect x="' + b + '" y="22.2" width="2.9" height="5.1" rx="1.2" fill="' + C.coat + '"/>' + shoe(b) + '</g>';
+
+    // 绿外套 + 金领口 + 扣子 + 红围巾
+    const coat = (x, w) =>
+        '<rect x="' + x + '" y="14.4" width="' + w + '" height="9" rx="2.6" fill="' + C.coat + '"/>' +
+        '<rect x="' + (x + 1.6) + '" y="14.2" width="' + (w - 3.2) + '" height="2" rx="1" fill="' + C.gold + '"/>' +
+        '<circle cx="' + (x + w / 2) + '" cy="18.6" r="0.55" fill="' + C.gold + '"/>' +
+        '<circle cx="' + (x + w / 2) + '" cy="20.8" r="0.55" fill="' + C.gold + '"/>';
+
+    let body;
+    if (dir === 'up' || dir === 'down') {
+        // 披肩发：圆润的发团 + 两缕垂到肩膀的发丝
+        const hairBack =
+            '<ellipse cx="15" cy="9.3" rx="7.8" ry="7.3" fill="' + C.hair + '"/>' +
+            '<path d="M7.9 8.8 q-1.7 3.4 -1.4 6.8 q0.2 1.6 1.5 1.6 q1.2 0 1.3 -1.6 q0.2 -2.9 1 -5.2z" fill="' + C.hair + '"/>' +
+            '<path d="M22.1 8.8 q1.7 3.4 1.4 6.8 q-0.2 1.6 -1.5 1.6 q-1.2 0 -1.3 -1.6 q-0.2 -2.9 -1 -5.2z" fill="' + C.hair + '"/>';
+        const head = '<circle cx="15" cy="9.9" r="5.2" fill="' + C.skin + '"/>';
+        // 刘海：盖住额头，边缘有点波浪
+        const bangs =
+            '<path d="M9.8 9.2 C9.8 5.2 12.2 3.4 15 3.4 C17.8 3.4 20.2 5.2 20.2 9.2 ' +
+            'C18.7 9.9 17.4 9.4 16 9.0 C14.5 8.6 13.4 9.7 11.8 9.7 C11 9.7 10.3 9.5 9.8 9.2 Z" fill="' + C.hair + '"/>';
+        const face = dir === 'down'
+            ? bangs +
+              '<circle cx="13.1" cy="10.3" r="0.85" fill="' + C.eye + '"/>' +
+              '<circle cx="16.9" cy="10.3" r="0.85" fill="' + C.eye + '"/>' +
+              '<circle cx="12.3" cy="11.9" r="0.7" fill="#f19a8a" opacity="0.7"/>' +
+              '<circle cx="17.7" cy="11.9" r="0.7" fill="#f19a8a" opacity="0.7"/>' +
+              '<path d="M14.1 12.9 q0.9 0.6 1.8 0" stroke="#c98a5a" stroke-width="0.6" fill="none"/>'
+            : '';
+        body =
+            shadow + legs(11.2, 16) +
+            coat(9.8, 10.4) +
+            // 围巾：脖子一圈 + 左侧飘带
+            '<path d="M11.5 15.9 q3.5 1.7 7 0" stroke="' + C.scarf + '" stroke-width="1.15" fill="none" stroke-linecap="round"/>' +
+            '<path d="M11.7 15.9 q-2.3 1.7 -1.9 4.7 l1.8 -0.5 q-0.7 -2.1 0.8 -3.2z" fill="' + C.scarf + '"/>' +
+            '<g class="arm arm-l"><rect x="7.4" y="15.4" width="2.6" height="4.6" rx="1.3" fill="' + C.coat + '"/>' +
+            '<circle cx="8.7" cy="20.6" r="1.15" fill="' + C.skin + '"/></g>' +
+            '<g class="arm arm-r"><rect x="20" y="15.4" width="2.6" height="4.6" rx="1.3" fill="' + C.coat + '"/>' +
+            bottleSVG(20.3, 16.4) +
+            '<circle cx="21.3" cy="20.6" r="1.15" fill="' + C.skin + '"/></g>' +
+            hairBack + head + face +
+            // 背面：整颗头都是头发
+            (dir === 'up' ? '<ellipse cx="15" cy="9.6" rx="5.3" ry="5.1" fill="' + C.hair + '"/>' : '');
+    } else {
+        // 侧面（默认朝右，朝左时整体镜像）：长发甩在身后
+        body =
+            shadow + legs(12.4, 15.2) +
+            coat(11, 8.4) +
+            '<path d="M12 15.9 q3 1.4 6 0" stroke="' + C.scarf + '" stroke-width="1.1" fill="none" stroke-linecap="round"/>' +
+            '<path d="M12.2 16 q-2.6 1.4 -3.2 3.8 l1.8 0.2 q0.4 -2 2.2 -2.6z" fill="' + C.scarf + '"/>' +
+            '<g class="arm arm-r"><rect x="16.8" y="15.4" width="2.6" height="4.6" rx="1.3" fill="' + C.coat + '"/>' +
+            bottleSVG(17.6, 16.4) +
+            '<circle cx="18.1" cy="20.6" r="1.15" fill="' + C.skin + '"/></g>' +
+            // 后面的披肩发
+            '<ellipse cx="14.6" cy="9.3" rx="7.4" ry="7.2" fill="' + C.hair + '"/>' +
+            '<path d="M9 8.8 q-2.2 3.4 -2.3 6.8 q0 1.7 1.5 1.7 q1.3 0 1.4 -1.7 q0.3 -3 1.1 -5.2z" fill="' + C.hair + '"/>' +
+            '<circle cx="16.8" cy="9.9" r="5" fill="' + C.skin + '"/>' +
+            // 侧面刘海
+            '<path d="M14.4 8.8 C14.6 5.4 16.4 3.6 18.6 3.6 C20.9 3.6 22.4 5.4 22.2 8.9 ' +
+            'C21 9.4 20 9 19 8.7 C17.8 8.4 16.2 9.3 14.4 8.8 Z" fill="' + C.hair + '"/>' +
+            '<circle cx="19.2" cy="10.3" r="0.85" fill="' + C.eye + '"/>' +
+            '<path d="M20.9 10.9 q1.1 0.6 0 1.3" stroke="#d9a06f" stroke-width="0.7" fill="none"/>';
+    }
+
+    const inner = dir === 'left' ? '<g transform="translate(30,0) scale(-1,1)">' + body + '</g>' : body;
+    return '<svg class="player-sprite' + (walking ? ' walking' : '') +
+        '" viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">' + inner + '</svg>';
+}
+
+function render() {
+    const board = document.getElementById('game-board');
+    if (!board) return;
+    board.innerHTML = '';
+    updateHUD();
+
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            let cell = document.createElement('div');
+            cell.className = 'cell';
+
+            if (!seen[y * W + x] && !(x === px && y === py)) {
+                cell.style.background = '#000';
+            } else {
+                if (x === px && y === py) {
+                    cell.classList.add('player');
+                    cell.innerHTML = playerSVG();
+                } else {
+                    const item = world[y * W + x];
+                    if (item === WALL) cell.classList.add('wall');
+                    if (item === WOOD) cell.classList.add('wood');
+                    if (item === GOLD) { cell.classList.add('gold'); cell.innerText = '★'; }
+                    if (item === SNAKE) { cell.classList.add('snake'); cell.innerText = '🐍'; }
+                }
+            }
+            board.appendChild(cell);
+        }
+    }
+}
+
+// 难度按钮
+['low', 'mid', 'high'].forEach((k) => {
+    const b = document.getElementById('btn-' + k);
+    if (b) b.addEventListener('click', () => setDifficulty(k));
+});
+
+// 启动
+try {
+    initWorld();
+    resetTimer();
+    render();
+    window.__caveReady = true;
+} catch (err) {
+    window.__caveReady = false;
+    const boot = document.getElementById('boot');
+    if (boot) {
+        boot.style.display = 'block';
+        boot.textContent = '游戏初始化失败：' + (err && err.message ? err.message : err);
+    }
+    throw err;
+}

@@ -7,19 +7,26 @@ const WALL = 1;   // 石墙：任何情况下都过不去
 const GOLD = 2;   // 星星
 const SNAKE = 3;  // 蛇
 const WOOD = 4;   // 木墙：可以用锤子砸开
+const MACHINE = 5; // 兑奖机：投入 5 颗星星换钥匙
+const DOOR = 6;    // 门：拿钥匙在这里按 F 通关
 
-const VERSION = 'v2.4';
+// 兑奖机（右下角倒数第二格）与门（最右下角）固定位置
+const GOAL_MACHINE = (H - 1) * W + (W - 2);
+const GOAL_DOOR = (H - 1) * W + (W - 1);
+
+const VERSION = 'v3.3';
 
 // ===== 难度配置 =====
 // wall: 石墙比例；snake: 蛇的数量；gold: 星星总数；target: 胜利所需；open: 放在明面上的星星
-// vault: 金库房间大小与层数；decoys: 诱饵木墙段数；snakeMs: 蛇每隔多少毫秒移动一格
+// vault: 金库房间大小与层数；decoys: 诱饵木墙段数
+// snakeMs: 蛇每隔多少毫秒移动一格（0 = 不移动）；patrol: 蛇离出生格最远多少步（巡逻范围）
 const DIFFS = {
     low:  { name: '低', wall: 0.22, snake: 8,  gold: 6, target: 5, vision: 2, open: 4,
-            vault: { size: 8, layers: 1 }, decoys: 2, snakeMs: 1100 },
-    mid:  { name: '中', wall: 0.24, snake: 12, gold: 6, target: 5, vision: 2, open: 3,
-            vault: { size: 9, layers: 1 }, decoys: 4, snakeMs: 900 },
-    high: { name: '高', wall: 0.24, snake: 16, gold: 6, target: 5, vision: 2, open: 3,
-            vault: { size: 10, layers: 2 }, decoys: 6, snakeMs: 700 },
+            vault: { size: 8, layers: 1 }, decoys: 2, snakeMs: 0, patrol: 0 },
+    mid:  { name: '中', wall: 0.24, snake: 7, gold: 6, target: 5, vision: 2, open: 3,
+            vault: { size: 9, layers: 1 }, decoys: 4, snakeMs: 1400, patrol: 4 },
+    high: { name: '高', wall: 0.24, snake: 12, gold: 6, target: 5, vision: 2, open: 3,
+            vault: { size: 10, layers: 2 }, decoys: 6, snakeMs: 1100, patrol: 5 },
 };
 let diffKey = 'low';
 let target = DIFFS.low.target;
@@ -32,6 +39,8 @@ let gameOver = false;
 let hammerUses = 3;              // 锤子剩余次数
 let facing = { dx: 1, dy: 0 };   // 朝向：最近一次按下的方向
 let lastVault = null;            // 最近一次生成的金库信息（调试/测试用）
+let goal = null;                 // { machine, door } 兑奖机与门的位置
+let hasKey = false;              // 是否已换到钥匙
 
 // ===== 计时器状态 =====
 let started = false;
@@ -101,8 +110,7 @@ const Sfx = (() => {
         src.stop(t0 + dur + 0.03);
     }
 
-    // ===== 背景音乐：原创的慢板分解和弦 =====
-    // （风格上参考《For River》那种温柔的钢琴独奏，但旋律是另行写的，不是原曲）
+    // ===== 背景音乐：原创的慢板分解和弦（初版，第一次按键后开始）=====
     const BPM = 70, BEAT = 60 / BPM, BAR = BEAT * 4;
     const PROG = [
         { bass: 45, tones: [57, 60, 64, 69], mel: 76 }, // Am
@@ -129,13 +137,13 @@ const Sfx = (() => {
 
     function scheduleBar(c, t0) {
         const p = PROG[musicBar % PROG.length];
-        warmNote(c, midi(p.bass), t0, BAR * 0.95, 0.040);          // 低音
+        warmNote(c, midi(p.bass), t0, BAR * 0.95, 0.040);            // 低音
         const pat = [0, 1, 2, 3, 2, 1, 0, 1];
-        for (let i = 0; i < 8; i++) {                               // 分解和弦
+        for (let i = 0; i < 8; i++) {                                 // 分解和弦
             const n = p.tones[pat[i]] + (i >= 4 ? 12 : 0);
             warmNote(c, midi(n), t0 + (i * BEAT) / 2, BEAT * 0.9, 0.026);
         }
-        warmNote(c, midi(p.mel), t0 + BEAT, BEAT * 2.2, 0.032);     // 旋律
+        warmNote(c, midi(p.mel), t0 + BEAT, BEAT * 2.2, 0.032);       // 旋律
         musicBar++;
     }
 
@@ -156,7 +164,7 @@ const Sfx = (() => {
     }
 
     return {
-        // 浏览器要求先有用户操作才能出声：第一次按键时调用
+        // 第一次按键/点击：解锁 AudioContext（音效需要）并确保音乐在放
         unlock() { ac(); startMusic(); },
         eat() { tone(880, 0.08, 'square', 0.12); tone(1320, 0.09, 'square', 0.10, 0.06); },
         breakWall() { noise(0.14, 0.30); tone(150, 0.12, 'sawtooth', 0.16, 0, 60); },
@@ -177,8 +185,28 @@ function isDeadly(w, x, y) {
            isSnake(w, x, y - 1) || isSnake(w, x, y + 1);
 }
 
+// 某格周围 r 步（曼哈顿距离）内有没有蛇 / 星星
+function nearType(w, x, y, r, type) {
+    for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+            if (Math.abs(dx) + Math.abs(dy) > r) continue;
+            const nx = x + dx, ny = y + dy;
+            if (inb(nx, ny) && w[idx(nx, ny)] === type) return true;
+        }
+    }
+    return false;
+}
+const nearSnake = (w, x, y, r) => nearType(w, x, y, r, SNAKE);
+const nearGold = (w, x, y, r) => nearType(w, x, y, r, GOLD);
+
 // 出生点附近（2×2 角落）不放墙和蛇
 const nearSpawn = (x, y) => x <= 1 && y <= 1;
+// 右下角留给兑奖机和门：这一带不放石墙
+const nearGoal = (x, y) => x >= W - 3 && y >= H - 3;
+// 兑奖机 / 门周围的安全圈
+const nearGoalCell = (x, y, r) =>
+    (Math.abs(x - GOAL_MACHINE % W) + Math.abs(y - ((GOAL_MACHINE / W) | 0)) <= r) ||
+    (Math.abs(x - GOAL_DOOR % W) + Math.abs(y - ((GOAL_DOOR / W) | 0)) <= r);
 
 // 从出生点出发，沿"可安全站立"的格子 BFS（石墙、木墙都挡住）
 function bfsSafe(w) {
@@ -490,6 +518,17 @@ function pickOpenStars(w, pool, count) {
     return chosen;
 }
 
+// 从右下角的门往左挖，直到接上已知可达的区域（不穿越金库）
+function carveToGoal(w, reachSet, vault) {
+    for (let x = W - 1; x >= 0; x--) {
+        const i = idx(x, H - 1);
+        if (inVaultBox(vault, x, H - 1, 1)) return false;
+        if (reachSet.has(i)) return true;
+        if (w[i] === WALL || w[i] === WOOD) w[i] = EMPTY;
+    }
+    return false;
+}
+
 // ===== 生成一局 =====
 function generateWorld(cfg) {
     lastVault = null;
@@ -499,13 +538,14 @@ function generateWorld(cfg) {
         // 石墙
         const nWall = Math.round(W * H * cfg.wall);
         for (let i = 0; i < nWall; i++) {
-            const loc = randEmpty(w, (x, y) => !nearSpawn(x, y));
+            const loc = randEmpty(w, (x, y) => !nearSpawn(x, y) && !nearGoal(x, y));
             if (loc >= 0) w[loc] = WALL;
         }
 
-        // 金库
+        // 金库（不要占用右下角的兑奖机/门区域）
         const vault = carveVault(w, cfg.vault);
         if (!vault) continue;
+        if (vault.box.x1 >= W - 4 && vault.box.y1 >= H - 4) continue;
 
         // 诱饵木墙
         placeDecoys(w, vault, cfg.decoys);
@@ -516,15 +556,36 @@ function generateWorld(cfg) {
             if (loc >= 0) w[loc] = SNAKE;
         }
 
-        const { reach, dist } = bfsSafe(w);
-        const reachSet = new Set(reach);
+        // 兑奖机与门固定在地图右下角：先清掉这一带的蛇，再放上去
+        for (let y = H - 5; y < H; y++) {
+            for (let x = W - 5; x < W; x++) {
+                if (inb(x, y) && w[idx(x, y)] === SNAKE) w[idx(x, y)] = EMPTY;
+            }
+        }
+        w[GOAL_MACHINE] = MACHINE;
+        w[GOAL_DOOR] = DOOR;
+
+        let bfs = bfsSafe(w);
+        let reach = bfs.reach, dist = bfs.dist;
+        let reachSet = new Set(reach);
         if (reach.length < cfg.open + 8) continue;
         if (!ringTouchesReach(w, vault, reachSet)) continue;
         if (!interiorReachable(w, vault)) continue;
 
+        // 兑奖机/门固定右下角：如果这一带暂时走不到，就沿最底行挖一条通道过去
+        if (!reachSet.has(GOAL_MACHINE) || !reachSet.has(GOAL_DOOR)) {
+            if (!carveToGoal(w, reachSet, vault)) continue;
+            bfs = bfsSafe(w);
+            reach = bfs.reach; dist = bfs.dist;
+            reachSet = new Set(reach);
+            if (!reachSet.has(GOAL_MACHINE) || !reachSet.has(GOAL_DOOR)) continue;
+        }
+
         // 明面上的星星：每颗落在不同象限、藏在墙角、彼此隔着墙且走路距离够远
         const openPool = reach.filter((i) => i !== 0 && i !== 1 && i !== W &&
+            w[i] === EMPTY &&
             dist[i] >= 5 && !inVaultBox(vault, i % W, (i / W) | 0, 0) &&
+            !nearSnake(w, i % W, (i / W) | 0, 2) &&
             nookSides(w, i) >= 2);
         if (openPool.length < cfg.open) continue;
         const openCells = pickOpenStars(w, openPool, cfg.open);
@@ -540,6 +601,7 @@ function generateWorld(cfg) {
         for (const c of vaultCells) w[c] = GOLD;
 
         lastVault = vault;
+        goal = { machine: GOAL_MACHINE, door: GOAL_DOOR };
         return w;
     }
 
@@ -548,14 +610,20 @@ function generateWorld(cfg) {
     for (let x = 0; x < W; x++) { w[idx(x, 2)] = WOOD; w[idx(x, 8)] = WOOD; }
     for (let y = 2; y <= 8; y++) { w[idx(2, y)] = WOOD; w[idx(17, y)] = WOOD; }
     for (let i = 0; i < cfg.gold; i++) w[idx(5 + i * 2, 5)] = GOLD;
+    w[GOAL_MACHINE] = MACHINE;
+    w[GOAL_DOOR] = DOOR;
+    goal = { machine: GOAL_MACHINE, door: GOAL_DOOR };
     return w;
 }
+
 
 // 初始化世界
 function initWorld() {
     const cfg = DIFFS[diffKey];
     target = cfg.target;
     hammerUses = 3;
+    goal = null;
+    hasKey = false;
     world = generateWorld(cfg);
     seen = new Array(W * H).fill(false);
 
@@ -565,6 +633,7 @@ function initWorld() {
     facing = { dx: 1, dy: 0 };
 
     seeAround(px, py);
+    initSnakeHomes();
     startSnakeTimer();
 }
 
@@ -581,10 +650,18 @@ function seeAround(cx, cy) {
 // ===== 巡逻蛇：按固定时间自己走，走位与玩家位置无关 =====
 // （蛇不会主动躲玩家；它正好走到玩家身上/身边，就算被咬）
 let snakeTimerId = null;
+// 每条蛇的"出生格"，用来限制巡逻范围（蛇只在出生点附近转）
+let snakeHomes = new Map();
+
+function initSnakeHomes() {
+    snakeHomes = new Map();
+    for (let i = 0; i < W * H; i++) if (world[i] === SNAKE) snakeHomes.set(i, i);
+}
 
 function startSnakeTimer() {
     stopSnakeTimer();
-    const ms = DIFFS[diffKey].snakeMs || 900;
+    const ms = DIFFS[diffKey].snakeMs || 0;
+    if (!ms) return; // 低难度：蛇原地不动
     snakeTimerId = setInterval(() => {
         if (gameOver) return;
         stepSnakes();
@@ -611,21 +688,29 @@ function isSnakeAdjacent() {
 function stepSnakes() {
     const cells = [];
     for (let i = 0; i < W * H; i++) if (world[i] === SNAKE) cells.push(i);
+    const patrol = DIFFS[diffKey].patrol || 0;
     let moved = 0;
 
     for (const i of cells) {
         if (world[i] !== SNAKE) continue;
         const x = i % W, y = (i / W) | 0;
+        const home = snakeHomes.has(i) ? snakeHomes.get(i) : i;
+        const hx = home % W, hy = (home / W) | 0;
         const dirs = shuffle([[1, 0], [-1, 0], [0, 1], [0, -1]]);
         for (const [dx, dy] of dirs) {
             const nx = x + dx, ny = y + dy;
             if (!inb(nx, ny)) continue;
+            if (patrol > 0 && Math.abs(nx - hx) + Math.abs(ny - hy) > patrol) continue; // 超出巡逻范围
             const ni = idx(nx, ny);
             if (world[ni] !== EMPTY) continue;                         // 墙/木墙/金币/其它蛇
             if (lastVault && inVaultBox(lastVault, nx, ny, 0)) continue; // 不进金库
             if (inSpawnSafeZone(nx, ny)) continue;                     // 不靠近出生点
+            if (nearGold(world, nx, ny, 2)) continue;                  // 不靠近星星（避免把星星围死）
+            if (nearGoalCell(nx, ny, 2)) continue;                     // 不靠近兑奖机/门
             world[i] = EMPTY;
             world[ni] = SNAKE;
+            snakeHomes.delete(i);
+            snakeHomes.set(ni, home);
             moved++;
             break;
         }
@@ -785,6 +870,7 @@ function countReachableGold(sx, sy) {
 // 锤子用完后，如果剩下的星星已经拿不到，直接判负
 function checkStuck() {
     if (gameOver || hammerUses > 0) return false;
+    if (hasKey) return false; // 已经有钥匙了，只差去开门
     if (pgold + countReachableGold(px, py) >= target) return false;
     gameOver = true;
     stopTimer();
@@ -844,15 +930,7 @@ function checkNewMove() {
         world[currentLoc] = EMPTY;
         pgold++;
         Sfx.eat();
-        if (pgold >= target) {
-            gameOver = true;
-            stopTimer();
-            stopSnakeTimer();
-            Sfx.win();
-            showOverlay('win', "🎉 恭喜通关！",
-                pickText(WIN_TEXTS) + "\n难度 " + DIFFS[diffKey].name + " · 收集 " + target + " 颗星星 · 用时 " + formatTime(elapsedMs) + "。");
-            return 2;
-        }
+        if (pgold >= target) flashMsg(`星星攒够了！去右下角的兑奖机按 F 换钥匙`);
     }
 
     // 四邻有蛇：死
@@ -863,6 +941,61 @@ function checkNewMove() {
 
     if (checkStuck()) return 4;
     return 1;
+}
+
+// ===== 兑奖机 / 门 =====
+function nearCell(type) {
+    if (world[idx(px, py)] === type) return true;
+    for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
+        const nx = px + dx, ny = py + dy;
+        if (inb(nx, ny) && world[idx(nx, ny)] === type) return true;
+    }
+    return false;
+}
+
+// 投入 5 颗星星换钥匙
+function useMachine() {
+    if (gameOver) return;
+    if (hasKey) { flashMsg("已经拿到钥匙了，去开门吧"); return; }
+    if (pgold < target) { flashMsg(`兑奖机要 ${target} 颗星星（当前 ${pgold} 颗）`); return; }
+
+    pgold -= target;
+    hasKey = true;
+    Sfx.eat();
+    seeAround(px, py);
+    render();
+    flashMsg(`兑换成功！获得道具【钥匙】🔑 — 去门前按 F`);
+}
+
+// 用钥匙开门 = 通关
+function useDoor() {
+    if (gameOver) return;
+    if (!hasKey) { flashMsg("门锁着：先攒 5 颗星星，到兑奖机按 F 换钥匙"); return; }
+    gameOver = true;
+    stopTimer();
+    stopSnakeTimer();
+    Sfx.win();
+    showOverlay('win', "🎉 恭喜通关！",
+        pickText(WIN_TEXTS) + "\n难度 " + DIFFS[diffKey].name + " · 收集 " + target + " 颗星星并开门 · 用时 " + formatTime(elapsedMs) + "。");
+}
+
+// F 键：站在机器/门上 > 对着机器/门 > 对着木墙 > 身边的机器/门 > 砸木墙
+function interact() {
+    if (gameOver) return;
+    const here = world[idx(px, py)];
+    if (here === MACHINE && !hasKey) return useMachine();
+    if (here === DOOR) return useDoor();
+
+    const fx = px + facing.dx, fy = py + facing.dy;
+    const f = inb(fx, fy) ? world[idx(fx, fy)] : -1;
+
+    if (f === MACHINE) return useMachine();
+    if (f === DOOR) return useDoor();
+    if (f === WOOD) return useHammer();
+
+    if (nearCell(MACHINE)) return useMachine();
+    if (nearCell(DOOR)) return useDoor();
+    return useHammer();
 }
 
 // 键盘：WASD 移动；F 砸木墙；1/2/3 切换难度；结束后 R 重开
@@ -881,7 +1014,7 @@ window.addEventListener('keydown', (e) => {
 
     if (gameOver) return;
 
-    if (key === 'f') { useHammer(); return; }
+    if (key === 'f') { interact(); return; }
 
     const ox = px, oy = py;
     switch (key) {
@@ -909,6 +1042,8 @@ function updateHUD() {
     if (d) d.textContent = DIFFS[diffKey].name;
     const hm = document.getElementById('hammer');
     if (hm) hm.textContent = hammerUses;
+    const kk = document.getElementById('key');
+    if (kk) kk.textContent = hasKey ? '🔑 有' : '无';
     const v = document.getElementById('ver');
     if (v) v.textContent = VERSION;
     ['low', 'mid', 'high'].forEach((k) => {
@@ -1051,6 +1186,8 @@ function render() {
                     if (item === WOOD) cell.classList.add('wood');
                     if (item === GOLD) { cell.classList.add('gold'); cell.innerText = '★'; }
                     if (item === SNAKE) { cell.classList.add('snake'); cell.innerText = '🐍'; }
+                    if (item === MACHINE) { cell.classList.add('machine'); cell.innerText = '🎰'; }
+                    if (item === DOOR) { cell.classList.add('door'); cell.innerText = '🚪'; }
                 }
             }
             board.appendChild(cell);

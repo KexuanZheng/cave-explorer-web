@@ -9,7 +9,7 @@ function fresh() {
   run(`
     world = new Array(W * H).fill(0);
     seen = new Array(W * H).fill(false);
-    px = 0; py = 0; pgold = 0; gameOver = false;
+    px = 0; py = 0; pgold = 0; gameOver = false; hasKey = false; goal = null;
     seeAround(0, 0);
     resetTimer();
     render();
@@ -53,9 +53,14 @@ console.log('[4] 胜利时冻结时间并显示用时');
 fresh();
 press('d');
 env.advance(2000);
-run('px = 0; py = 0; pgold = 4; world[1] = 2;'); // 4 个金币 + 右边 1 个
-press('d');
-check('金币数 = 5', run('pgold') === 5);
+// 攒够 5 颗星星 → 兑奖机换钥匙 → 门前开门
+run('world[1] = 5; world[2] = 6; goal = { machine: 1, door: 2 }; px = 0; py = 0; facing = { dx: 1, dy: 0 }; pgold = 5; render();');
+press('f');
+check('换到钥匙', run('hasKey') === true);
+check('星星被消耗', run('pgold') === 0);
+check('换钥匙时还没赢', run('gameOver') === false);
+run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+press('f');
 check('gameOver = true', run('gameOver') === true);
 check('计时已冻结', run('finished') === true);
 check('冻结值 = 2000 ms', Math.abs(run('elapsedMs') - 2000) < 1e-6, String(run('elapsedMs')));
