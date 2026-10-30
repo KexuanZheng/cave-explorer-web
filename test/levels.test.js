@@ -189,8 +189,8 @@ check('高难度金库 2 层', high.vault.layers === 2);
 check('高难度蛇更多', high.snake > low.snake, `${low.snake} vs ${high.snake}`);
 check('高难度明面星星更少', high.open < low.open, `${low.open} vs ${high.open}`);
 
-console.log('\n[兑奖机与门]');
-let noGoal = 0, unreachable = 0, deadlyGoal = 0, notCorner = 0, farApart = 0, notFixed = 0;
+console.log('\n[门与钥匙]');
+let noGoal = 0, unreachable = 0, deadlyGoal = 0, notFixed = 0;
 const N_G = 60;
 for (const key of ['low', 'mid', 'high']) {
   for (let i = 0; i < N_G; i++) {
@@ -199,34 +199,26 @@ for (const key of ['low', 'mid', 'high']) {
       const reach = new Set(bfsSafe(w).reach);
       const g = goal;
       if (!g) return { missing: 1 };
-      const xy = (c) => [c % W, (c / W) | 0];
-      const [mx, my] = xy(g.machine);
-      const [dx, dy] = xy(g.door);
+      const dx = g.door % W, dy = (g.door / W) | 0;
       return {
         missing: 0,
-        unreach: (reach.has(g.machine) ? 0 : 1) + (reach.has(g.door) ? 0 : 1),
-        deadly: (isDeadly(w, mx, my) ? 1 : 0) + (isDeadly(w, dx, dy) ? 1 : 0),
-        corner: dx + dy,
-        apart: Math.abs(mx - dx) + Math.abs(my - dy),
-        kinds: (w.filter((v) => v === 5).length === 1 && w.filter((v) => v === 6).length === 1) ? 1 : 0,
-        fixed: (dx === W - 1 && dy === H - 1 && mx === W - 2 && my === H - 1) ? 1 : 0,
+        unreach: reach.has(g.door) ? 0 : 1,
+        deadly: isDeadly(w, dx, dy) ? 1 : 0,
+        kinds: (w.filter((v) => v === 6).length === 1 && w.filter((v) => v === 5).length === 0) ? 1 : 0,
+        fixed: (dx === W - 1 && dy === H - 1) ? 1 : 0,
       };
     })()`);
     if (r.missing) { noGoal++; continue; }
     if (r.unreach) unreachable++;
     if (r.deadly) deadlyGoal++;
-    if (r.corner < 18) notCorner++;
-    if (r.apart > 4) farApart++;
     if (!r.kinds) noGoal++;
     if (!r.fixed) notFixed++;
   }
 }
-check('每局都有兑奖机和门', noGoal === 0, `${noGoal} 局缺失`);
-check('兑奖机与门都能走到（不用砸墙）', unreachable === 0, `${unreachable} 个不到`);
-check('兑奖机与门都不贴蛇', deadlyGoal === 0, `${deadlyGoal} 个危险`);
-check('门在画面右下角', notCorner === 0, `${notCorner} 局太靠左上`);
-check('兑奖机固定在 (18,11)、门固定在 (19,11)', notFixed === 0, `${notFixed} 局位置不对`);
-check('兑奖机就在门附近（≤4 步）', farApart === 0, `${farApart} 局太远`);
+check('每局都有门（没有兑奖机了）', noGoal === 0, `${noGoal} 局不对`);
+check('门一定能走到（不用砸墙）', unreachable === 0, `${unreachable} 个不到`);
+check('门不贴蛇', deadlyGoal === 0, `${deadlyGoal} 个危险`);
+check('门固定在 (19,11)', notFixed === 0, `${notFixed} 局位置不对`);
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

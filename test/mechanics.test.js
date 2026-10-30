@@ -13,6 +13,8 @@ function fresh() {
     world = new Array(W * H).fill(0);
     seen = new Array(W * H).fill(false);
     px = 0; py = 0; pgold = 0; gameOver = false; hasKey = false; goal = null;
+    keyPos = -1; keySpawned = false;
+    if (keyTimer) { clearInterval(keyTimer); keyTimer = null; }
     hammerUses = 3; facing = { dx: 1, dy: 0 }; stopSnakeTimer(); stopSnakeTimer();
     lastVault = null;
     seeAround(0, 0);
@@ -163,33 +165,33 @@ check('失败文案会随机变化', loseSeen.size >= 2, `${loseSeen.size} 种`)
 const winSeen = new Set();
 for (let i = 0; i < 40; i++) {
   fresh();
-  // 手搭一个 兑奖机(1,0) + 门(2,0) 的场景
-  run('world[1] = 5; world[2] = 6; goal = { machine: 1, door: 2 };');
-  run('px = 0; py = 0; pgold = 5; facing = { dx: 1, dy: 0 };');
-  press('f');   // 兑奖机换钥匙
-  run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
-  press('f');   // 开门
+  run('world[1] = 2; pgold = 4;');
+  press('d');                                       // 第 5 颗星 → 刷钥匙
+  run('px = keyPos % W; py = (keyPos / W) | 0; checkNewMove();');   // 捡钥匙
+  run('world[2] = 6; px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+  press('f');                                       // 开门
   winSeen.add(env.overlayMsg().split('\n')[0]);
 }
 check('胜利文案都来自预置列表', [...winSeen].every((t) => WIN.includes(t)), [...winSeen].join(' | '));
 check('胜利文案会随机变化', winSeen.size >= 2, `${winSeen.size} 种`);
 
-console.log('[8] 兑奖机与门的规则');
+console.log('[8] 钥匙规则');
 fresh();
-run('world[1] = 5; world[2] = 6; goal = { machine: 1, door: 2 }; px = 0; py = 0; facing = { dx: 1, dy: 0 }; pgold = 3;');
-press('f');
-check('星星不够不给钥匙', run('hasKey') === false);
-run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+run('world[1] = 2; pgold = 4; seen.fill(true);');
+press('d');
+check('集齐 5 颗会刷出钥匙', run('keySpawned') === true);
+check('低难度钥匙在地图中央', run('keyPos') === 10 + 6 * W, String(run('keyPos')));
+check('还没捡到钥匙', run('hasKey') === false);
+run('world[2] = 6; px = 2; py = 1; facing = { dx: 0, dy: -1 };');
 press('f');
 check('没钥匙开不了门', run('gameOver') === false);
-run('px = 0; py = 0; facing = { dx: 1, dy: 0 }; pgold = 5;');
-press('f');
-check('星星够了给钥匙', run('hasKey') === true);
-check('消耗 5 颗星星', run('pgold') === 0, String(run('pgold')));
-check('换钥匙本身不算赢', run('gameOver') === false);
-run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+run('px = keyPos % W; py = (keyPos / W) | 0; checkNewMove();');
+check('踩到钥匙就捡起来', run('hasKey') === true);
+check('捡钥匙不算通关', run('gameOver') === false);
+run('world[2] = 6; px = 2; py = 1; facing = { dx: 0, dy: -1 };');
 press('f');
 check('有钥匙开门通关', run('gameOver') === true);
+
 
 console.log('[9] 蛇不会把星星/门围死');
 run("diffKey = 'high'");
@@ -216,7 +218,7 @@ for (let i = 0; i < 400; i++) {
     let badGoal = 0;
     for (const b of snakes) {
       const x = b % W, y = (b / W) | 0;
-      for (const g of [GOAL_MACHINE, GOAL_DOOR]) {
+      for (const g of [GOAL_DOOR]) {
         const gx = g % W, gy = (g / W) | 0;
         if (Math.abs(x - gx) + Math.abs(y - gy) <= 2) badGoal++;
       }
@@ -228,7 +230,80 @@ for (let i = 0; i < 400; i++) {
   if (run('gameOver')) break;
 }
 check('蛇从不进入星星周围 2 格', tooClose === 0, String(tooClose));
-check('蛇从不进入兑奖机/门周围 2 格', goalClose === 0, String(goalClose));
+check('蛇从不进入门周围 2 格', goalClose === 0, String(goalClose));
+
+console.log('[10] 难度锁定');
+run("diffKey = 'low'");
+fresh();
+press('d');
+check('开始计时', run('started') === true);
+press('2');
+check('游戏中按 2 不改难度', run('diffKey') === 'low', String(run('diffKey')));
+press('3');
+check('游戏中按 3 不改难度', run('diffKey') === 'low', String(run('diffKey')));
+
+console.log('[11] 三档音乐（低=最初版，中/高各一首）');
+const bpmL = run("DIFFS.low.bpm"), bpmM = run("DIFFS.mid.bpm"), bpmH = run("DIFFS.high.bpm");
+check('三档速度各不相同', bpmL !== bpmM && bpmM !== bpmH && bpmL !== bpmH, `${bpmL}/${bpmM}/${bpmH}`);
+check('低难度最慢', bpmL < bpmM && bpmL < bpmH, `${bpmL}/${bpmM}/${bpmH}`);
+
+console.log('[12] 钥匙按难度刷新');
+run("diffKey = 'low'");
+fresh();
+run('world[1] = 2; pgold = 4; seen.fill(true);');
+press('d');
+const centerCell = 10 + 6 * run('W');
+check('低难度钥匙在正中', run('keyPos') === centerCell, String(run('keyPos')));
+check('钥匙在可达格子上', run('bfsSafe(world).reach').includes(run('keyPos')) === true);
+
+run("diffKey = 'mid'");
+let centerCount = 0;
+for (let i = 0; i < 20; i++) {
+  fresh();
+  run('world[1] = 2; pgold = 4;');
+  press('d');
+  if (run('keyPos') === centerCell) centerCount++;
+}
+check('中难度钥匙随机刷新', centerCount < 20, `${centerCount}/20 在正中`);
+
+// 只点亮出生点周围时，钥匙也只会出现在已点亮的格子上
+run("diffKey = 'mid'");
+fresh();
+run('world[1] = 2; pgold = 4;');
+press('d');
+check('钥匙只刷在已点亮的格子上', run('seen[keyPos]') === true, String(run('keyPos')));
+
+run("diffKey = 'high'");
+fresh();
+run('world[1] = 2; pgold = 4;');
+press('d');
+const k0 = run('keyPos');
+env.advance(1700);
+const k1 = run('keyPos');
+check('高难度钥匙会移动', k0 !== k1, `${k0} -> ${k1}`);
+const kx0 = k0 % run('W'), ky0 = (k0 / run('W')) | 0;
+const kx1 = k1 % run('W'), ky1 = (k1 / run('W')) | 0;
+const stepDist = Math.abs(kx0 - kx1) + Math.abs(ky0 - ky1);
+check('钥匙是一格一格走（不是瞬移）', stepDist === 1, `${k0} -> ${k1} 距离 ${stepDist}`);
+check('移动后仍在已点亮的地方', run('seen[keyPos]') === true);
+check('移动后仍然可达', run('bfsSafe(world).reach').includes(k1) === true);
+run('stopKeyTimer()');
+
+console.log('[13] 个人纪录');
+run("diffKey = 'low'");
+run('bests = {};');
+check('第一次通关会记录', run('recordWin(5000)') === true);
+check('更慢的成绩不覆盖', run('recordWin(8000)') === false);
+check('更快的成绩会覆盖', run('recordWin(3000)') === true);
+check('纪录值 = 3000', run('bests.low') === 3000, String(run('bests.low')));
+run('bests = {};');
+fresh();
+run('world[1] = 2; pgold = 4; seen.fill(true);');
+press('d');
+run('px = keyPos % W; py = (keyPos / W) | 0; checkNewMove();');
+run('world[2] = 6; px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+press('f');
+check('真通关后纪录写入 bests', typeof run('bests.low') === 'number', String(run('bests.low')));
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

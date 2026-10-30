@@ -1,0 +1,8 @@
+*.o
+*.obj
+*.sym
+*.out
+cave
+do_tests
+puzzle
+broken

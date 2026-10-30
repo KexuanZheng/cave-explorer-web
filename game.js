@@ -7,26 +7,30 @@ const WALL = 1;   // 石墙：任何情况下都过不去
 const GOLD = 2;   // 星星
 const SNAKE = 3;  // 蛇
 const WOOD = 4;   // 木墙：可以用锤子砸开
-const MACHINE = 5; // 兑奖机：投入 5 颗星星换钥匙
-const DOOR = 6;    // 门：拿钥匙在这里按 F 通关
+const DOOR = 6;    // 门：拿到钥匙后在这里按 F 通关
+const KEY = 7;     // 钥匙：集齐星星后出现在地图上，捡到才能开门
 
-// 兑奖机（右下角倒数第二格）与门（最右下角）固定位置
-const GOAL_MACHINE = (H - 1) * W + (W - 2);
+// 门固定在地图右下角
 const GOAL_DOOR = (H - 1) * W + (W - 1);
 
-const VERSION = 'v3.3';
+const VERSION = 'v4.5';
 
 // ===== 难度配置 =====
 // wall: 石墙比例；snake: 蛇的数量；gold: 星星总数；target: 胜利所需；open: 放在明面上的星星
 // vault: 金库房间大小与层数；decoys: 诱饵木墙段数
 // snakeMs: 蛇每隔多少毫秒移动一格（0 = 不移动）；patrol: 蛇离出生格最远多少步（巡逻范围）
+// keyMode: 钥匙位置（center 固定在中央 / random 随机 / moving 随机移动）；keyMoveMs: 移动间隔
+// bpm: 背景音乐速度（高难度最快、低难度最慢）
 const DIFFS = {
     low:  { name: '低', wall: 0.22, snake: 8,  gold: 6, target: 5, vision: 2, open: 4,
-            vault: { size: 8, layers: 1 }, decoys: 2, snakeMs: 0, patrol: 0 },
+            vault: { size: 8, layers: 1 }, decoys: 2, snakeMs: 0, patrol: 0,
+            keyMode: 'center', keyMoveMs: 0, bpm: 56 },
     mid:  { name: '中', wall: 0.24, snake: 7, gold: 6, target: 5, vision: 2, open: 3,
-            vault: { size: 9, layers: 1 }, decoys: 4, snakeMs: 1400, patrol: 4 },
+            vault: { size: 9, layers: 1 }, decoys: 4, snakeMs: 1400, patrol: 4,
+            keyMode: 'random', keyMoveMs: 0, bpm: 118 },
     high: { name: '高', wall: 0.24, snake: 12, gold: 6, target: 5, vision: 2, open: 3,
-            vault: { size: 10, layers: 2 }, decoys: 6, snakeMs: 1100, patrol: 5 },
+            vault: { size: 10, layers: 2 }, decoys: 6, snakeMs: 1100, patrol: 5,
+            keyMode: 'moving', keyMoveMs: 1600, bpm: 76 },
 };
 let diffKey = 'low';
 let target = DIFFS.low.target;
@@ -39,8 +43,11 @@ let gameOver = false;
 let hammerUses = 3;              // 锤子剩余次数
 let facing = { dx: 1, dy: 0 };   // 朝向：最近一次按下的方向
 let lastVault = null;            // 最近一次生成的金库信息（调试/测试用）
-let goal = null;                 // { machine, door } 兑奖机与门的位置
-let hasKey = false;              // 是否已换到钥匙
+let goal = null;                 // { door } 门的位置
+let hasKey = false;              // 是否已拿到钥匙
+let keyPos = -1;                 // 地图上钥匙所在格子（-1 表示还没有）
+let keySpawned = false;          // 是否已经刷过钥匙
+let keyTimer = null;             // 高难度：钥匙随机移动的定时器
 
 // ===== 计时器状态 =====
 let started = false;
@@ -110,16 +117,76 @@ const Sfx = (() => {
         src.stop(t0 + dur + 0.03);
     }
 
-    // ===== 背景音乐：原创的慢板分解和弦（初版，第一次按键后开始）=====
-    const BPM = 70, BEAT = 60 / BPM, BAR = BEAT * 4;
-    const PROG = [
-        { bass: 45, tones: [57, 60, 64, 69], mel: 76 }, // Am
-        { bass: 41, tones: [53, 57, 60, 65], mel: 74 }, // F
-        { bass: 48, tones: [55, 60, 64, 67], mel: 72 }, // C
-        { bass: 43, tones: [55, 59, 62, 67], mel: 71 }, // G
-    ];
+    // ===== 背景音乐：三首原创曲子 =====
+    // low  = 舒缓（和最初那版一模一样）
+    // mid  = 压抑：A 小调 + 低音持续音 + 半音下行 + 属和弦导音，慢速阴郁
+    // high = 紧张：E 小调 + 低音半音下行 E-D#-C-B，16 分音符固定音型 + 心跳打击
+    const TRACKS = {
+        low: {
+            bpm: 56, arp: [0, 1, 2, 3, 2, 1, 0, 1], div: 2, mels: null,
+            prog: [
+                { bass: 45, tones: [57, 60, 64, 69], mel: 76 }, // Am
+                { bass: 41, tones: [53, 57, 60, 65], mel: 74 }, // F
+                { bass: 48, tones: [55, 60, 64, 67], mel: 72 }, // C
+                { bass: 43, tones: [55, 59, 62, 67], mel: 71 }, // G
+            ],
+            perc: null,
+        },
+        mid: {
+            // A 小调，低音一路下行 A-G-F-E（追赶感），旋律是老老实实的音阶
+            bpm: 118, arp: [0, 1, 2, 1, 0, 1, 2, 1, 0, 1, 2, 1, 2, 1, 0, 1], div: 4,
+            pulse: true,
+            prog: [
+                { bass: 45, tones: [57, 60, 64] }, // Am
+                { bass: 43, tones: [55, 59, 62] }, // G
+                { bass: 41, tones: [53, 57, 60] }, // F
+                { bass: 40, tones: [52, 56, 59] }, // E（导音）
+            ],
+            mels: [
+                [[0, 76, 0.5], [0.5, 74, 0.5], [1, 72, 1], [2, 74, 0.5], [2.5, 76, 0.5], [3, 79, 1]],
+                [[0, 77, 1], [1, 76, 1], [2, 74, 1], [3, 72, 1]],
+                [[0, 69, 1], [1, 72, 1], [2, 77, 1], [3, 76, 1]],
+                [[0, 76, 0.5], [0.5, 74, 0.5], [1, 71, 1], [2, 68, 2]],
+            ],
+            perc: [[0, 'k'], [1, 'k'], [2, 'k'], [3, 'k'], [0.5, 't'], [1.5, 't'], [2.5, 't'], [3.5, 't']],
+        },
+        high: {
+            // 压抑版：慢速 + 低音持续音 + 借用 iv（Fm）压暗，属和弦导音悬着不解决
+            bpm: 76, arp: [0, 1, 2, 1], div: 1, drone: 33,
+            prog: [
+                { bass: 45, tones: [57, 60, 64] }, // Am
+                { bass: 41, tones: [53, 56, 60] }, // Fm（借用 iv，压暗）
+                { bass: 38, tones: [50, 53, 57] }, // Dm
+                { bass: 40, tones: [52, 56, 59] }, // E（导音，悬着不解决）
+            ],
+            mels: [
+                [[0, 76, 2], [2, 77, 1], [3, 76, 1]],         // E5 F5 E5
+                [[0, 75, 2], [2, 72, 1], [3, 71, 1]],         // Eb5 C5 B4
+                [[0, 74, 1.5], [1.5, 72, 1], [2.5, 69, 1.5]], // D5 C5 A4
+                [[0, 71, 2], [2, 68, 2]],                     // B4 G#4
+            ],
+            perc: [[0, 'k'], [2.5, 't']],
+        },
+    };
+
+    let TRACK = TRACKS.low;
+    let BPM = TRACK.bpm, BEAT = 60 / BPM, BAR = BEAT * 4;
     let musicOn = false, musicTimer = null, musicBar = 0, musicNext = 0;
     const midi = (n) => 440 * Math.pow(2, (n - 69) / 12);
+
+    // 所有音乐都经过这一级"总线"，切曲子时把旧总线静音即可立刻切干净
+    let musicBus = null;
+
+    function makeMusicBus(c) {
+        const g = c.createGain();
+        g.gain.value = 1;
+        g.connect(c.destination);
+        return g;
+    }
+
+    function outOf(c) {
+        return musicBus || c.destination;
+    }
 
     function warmNote(c, freq, t, dur, vol) {
         const osc = c.createOscillator();
@@ -130,29 +197,79 @@ const Sfx = (() => {
         g.gain.exponentialRampToValueAtTime(vol, t + 0.04);
         g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
         osc.connect(g);
-        g.connect(c.destination);
+        g.connect(outOf(c));
         osc.start(t);
         osc.stop(t + dur + 0.05);
     }
 
+    // 打击乐：短促的低频"咚"和高频"哒"
+    function hit(c, freq, t, dur, vol) {
+        const o = c.createOscillator();
+        const g = c.createGain();
+        o.type = 'sine';
+        o.frequency.setValueAtTime(freq, t);
+        o.frequency.exponentialRampToValueAtTime(Math.max(45, freq * 0.35), t + dur);
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.connect(g);
+        g.connect(outOf(c));
+        o.start(t);
+        o.stop(t + dur + 0.02);
+    }
+
     function scheduleBar(c, t0) {
-        const p = PROG[musicBar % PROG.length];
-        warmNote(c, midi(p.bass), t0, BAR * 0.95, 0.040);            // 低音
-        const pat = [0, 1, 2, 3, 2, 1, 0, 1];
-        for (let i = 0; i < 8; i++) {                                 // 分解和弦
-            const n = p.tones[pat[i]] + (i >= 4 ? 12 : 0);
-            warmNote(c, midi(n), t0 + (i * BEAT) / 2, BEAT * 0.9, 0.026);
+        const bar = musicBar;
+        const ch = TRACK.prog[bar % TRACK.prog.length];
+
+        // 持续低音（中难度的"压迫感"来源）
+        if (TRACK.drone) warmNote(c, midi(TRACK.drone), t0, BAR * 1.02, 0.030);
+
+        // 低音
+        if (TRACK.pulse) {
+            // 驱动型：每拍一下，八度交替（高难度）
+            for (let b = 0; b < 4; b++) {
+                warmNote(c, midi(ch.bass + (b % 2 ? 12 : 0)), t0 + b * BEAT, BEAT * 0.55, 0.034);
+            }
+        } else {
+            warmNote(c, midi(ch.bass), t0, BAR * 0.95, 0.048);
+            warmNote(c, midi(ch.bass + 7), t0 + 2 * BEAT, BEAT * 1.5, 0.026);
         }
-        warmNote(c, midi(p.mel), t0 + BEAT, BEAT * 2.2, 0.032);       // 旋律
+
+        // 分解和弦：每个音的时值跟小节长度走
+        const step = BAR / TRACK.arp.length;
+        for (let i = 0; i < TRACK.arp.length; i++) {
+            const k = TRACK.arp[i];
+            const n = ch.tones[k % ch.tones.length] + (k >= ch.tones.length ? 12 : 0);
+            warmNote(c, midi(n), t0 + i * step, step * 1.6, 0.016 + (i % 4 === 0 ? 0.008 : 0));
+        }
+
+        // 旋律：低难度沿用初版"每小节一个长音"，中/高难度是真正的旋律
+        if (TRACK.mels) {
+            const line = TRACK.mels[bar % TRACK.mels.length];
+            for (const [b, n, d] of line) {
+                warmNote(c, midi(n), t0 + b * BEAT, d * BEAT, 0.042);
+            }
+        } else if (ch.mel) {
+            warmNote(c, midi(ch.mel), t0 + BEAT, BEAT * 2.2, 0.032);
+        }
+
+        // 打击：'k' = 低沉的心跳，'t' = 短促的金属感
+        if (TRACK.perc) {
+            for (const [b, kind] of TRACK.perc) {
+                if (kind === 'k') hit(c, 85, t0 + b * BEAT, 0.10, 0.060);
+                else hit(c, 2600, t0 + b * BEAT, 0.04, 0.016);
+            }
+        }
         musicBar++;
     }
 
     function startMusic() {
         const c = ac();
         if (!c || musicOn) return;
+        if (!musicBus) musicBus = makeMusicBus(c);
         musicOn = true;
         musicBar = 0;
-        musicNext = c.currentTime + 0.3;
+        musicNext = c.currentTime + 0.02;   // 立刻开始，不留空档
         musicTimer = setInterval(() => {
             const cc = ac();
             if (!cc) return;
@@ -163,6 +280,37 @@ const Sfx = (() => {
         }, 250);
     }
 
+    // 换曲子（难度切换时调用）：把旧曲立刻掐断，再从头放新曲
+    function setTrack(key) {
+        const t = TRACKS[key] || TRACKS.low;
+        if (t === TRACK) return;
+        TRACK = t;
+        BPM = TRACK.bpm;
+        BEAT = 60 / BPM;
+        BAR = BEAT * 4;
+
+        if (!musicOn) return;
+
+        const c = ac();
+        // 1) 旧总线 40ms 内淡出到 0，并断开（已经排到未来的音符也一起哑掉）
+        if (c && musicBus) {
+            const old = musicBus;
+            const now = c.currentTime;
+            try {
+                old.gain.cancelScheduledValues(now);
+                old.gain.setValueAtTime(old.gain.value, now);
+                old.gain.exponentialRampToValueAtTime(0.0001, now + 0.04);
+            } catch (e) {}
+            setTimeout(() => { try { old.disconnect(); } catch (e) {} }, 200);
+        }
+        // 2) 换一条新的总线，立刻开始新曲
+        musicBus = c ? makeMusicBus(c) : null;
+        clearInterval(musicTimer);
+        musicTimer = null;
+        musicOn = false;
+        startMusic();
+    }
+
     return {
         // 第一次按键/点击：解锁 AudioContext（音效需要）并确保音乐在放
         unlock() { ac(); startMusic(); },
@@ -170,6 +318,16 @@ const Sfx = (() => {
         breakWall() { noise(0.14, 0.30); tone(150, 0.12, 'sawtooth', 0.16, 0, 60); },
         win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'triangle', 0.16, i * 0.12)); },
         lose() { [392, 330, 262, 196].forEach((f, i) => tone(f, 0.2, 'sawtooth', 0.14, i * 0.13)); },
+        // "叮铃"：集齐星星 / 捡到钥匙
+        ding() {
+            tone(1318, 0.20, 'triangle', 0.16);
+            tone(1760, 0.24, 'triangle', 0.12, 0.10);
+            tone(2637, 0.30, 'sine', 0.06, 0.18);
+        },
+        // 三档难度三首曲子：低=舒缓、中=紧张、高=激烈
+        mood(key) {
+            setTrack(key);
+        },
     };
 })();
 
@@ -203,10 +361,9 @@ const nearGold = (w, x, y, r) => nearType(w, x, y, r, GOLD);
 const nearSpawn = (x, y) => x <= 1 && y <= 1;
 // 右下角留给兑奖机和门：这一带不放石墙
 const nearGoal = (x, y) => x >= W - 3 && y >= H - 3;
-// 兑奖机 / 门周围的安全圈
+// 门周围的安全圈（蛇不进来）
 const nearGoalCell = (x, y, r) =>
-    (Math.abs(x - GOAL_MACHINE % W) + Math.abs(y - ((GOAL_MACHINE / W) | 0)) <= r) ||
-    (Math.abs(x - GOAL_DOOR % W) + Math.abs(y - ((GOAL_DOOR / W) | 0)) <= r);
+    Math.abs(x - (GOAL_DOOR % W)) + Math.abs(y - ((GOAL_DOOR / W) | 0)) <= r;
 
 // 从出生点出发，沿"可安全站立"的格子 BFS（石墙、木墙都挡住）
 function bfsSafe(w) {
@@ -556,13 +713,12 @@ function generateWorld(cfg) {
             if (loc >= 0) w[loc] = SNAKE;
         }
 
-        // 兑奖机与门固定在地图右下角：先清掉这一带的蛇，再放上去
+        // 门固定在地图右下角：先清掉这一带的蛇，再放上去
         for (let y = H - 5; y < H; y++) {
             for (let x = W - 5; x < W; x++) {
                 if (inb(x, y) && w[idx(x, y)] === SNAKE) w[idx(x, y)] = EMPTY;
             }
         }
-        w[GOAL_MACHINE] = MACHINE;
         w[GOAL_DOOR] = DOOR;
 
         let bfs = bfsSafe(w);
@@ -572,13 +728,13 @@ function generateWorld(cfg) {
         if (!ringTouchesReach(w, vault, reachSet)) continue;
         if (!interiorReachable(w, vault)) continue;
 
-        // 兑奖机/门固定右下角：如果这一带暂时走不到，就沿最底行挖一条通道过去
-        if (!reachSet.has(GOAL_MACHINE) || !reachSet.has(GOAL_DOOR)) {
+        // 门固定右下角：如果这一带暂时走不到，就沿最底行挖一条通道过去
+        if (!reachSet.has(GOAL_DOOR)) {
             if (!carveToGoal(w, reachSet, vault)) continue;
             bfs = bfsSafe(w);
             reach = bfs.reach; dist = bfs.dist;
             reachSet = new Set(reach);
-            if (!reachSet.has(GOAL_MACHINE) || !reachSet.has(GOAL_DOOR)) continue;
+            if (!reachSet.has(GOAL_DOOR)) continue;
         }
 
         // 明面上的星星：每颗落在不同象限、藏在墙角、彼此隔着墙且走路距离够远
@@ -601,7 +757,7 @@ function generateWorld(cfg) {
         for (const c of vaultCells) w[c] = GOLD;
 
         lastVault = vault;
-        goal = { machine: GOAL_MACHINE, door: GOAL_DOOR };
+        goal = { door: GOAL_DOOR };
         return w;
     }
 
@@ -610,9 +766,8 @@ function generateWorld(cfg) {
     for (let x = 0; x < W; x++) { w[idx(x, 2)] = WOOD; w[idx(x, 8)] = WOOD; }
     for (let y = 2; y <= 8; y++) { w[idx(2, y)] = WOOD; w[idx(17, y)] = WOOD; }
     for (let i = 0; i < cfg.gold; i++) w[idx(5 + i * 2, 5)] = GOLD;
-    w[GOAL_MACHINE] = MACHINE;
     w[GOAL_DOOR] = DOOR;
-    goal = { machine: GOAL_MACHINE, door: GOAL_DOOR };
+    goal = { door: GOAL_DOOR };
     return w;
 }
 
@@ -624,6 +779,9 @@ function initWorld() {
     hammerUses = 3;
     goal = null;
     hasKey = false;
+    keyPos = -1;
+    keySpawned = false;
+    stopKeyTimer();
     world = generateWorld(cfg);
     seen = new Array(W * H).fill(false);
 
@@ -635,6 +793,7 @@ function initWorld() {
     seeAround(px, py);
     initSnakeHomes();
     startSnakeTimer();
+    Sfx.mood(diffKey);   // 音乐速度跟着难度走
 }
 
 function seeAround(cx, cy) {
@@ -839,6 +998,7 @@ function newGame() {
 
 function setDifficulty(key) {
     if (!DIFFS[key]) return;
+    if (started && !gameOver) return;   // 游戏进行中不能改难度
     diffKey = key;
     newGame();
 }
@@ -930,8 +1090,11 @@ function checkNewMove() {
         world[currentLoc] = EMPTY;
         pgold++;
         Sfx.eat();
-        if (pgold >= target) flashMsg(`星星攒够了！去右下角的兑奖机按 F 换钥匙`);
+        if (pgold >= target) spawnKey();   // 集齐 5 颗：叮铃 + 刷出钥匙
     }
+
+    // 踩到钥匙
+    if (world[currentLoc] === KEY) pickKey();
 
     // 四邻有蛇：死
     for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
@@ -943,7 +1106,7 @@ function checkNewMove() {
     return 1;
 }
 
-// ===== 兑奖机 / 门 =====
+// ===== 钥匙 / 门 =====
 function nearCell(type) {
     if (world[idx(px, py)] === type) return true;
     for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
@@ -953,59 +1116,150 @@ function nearCell(type) {
     return false;
 }
 
-// 投入 5 颗星星换钥匙
-function useMachine() {
-    if (gameOver) return;
-    if (hasKey) { flashMsg("已经拿到钥匙了，去开门吧"); return; }
-    if (pgold < target) { flashMsg(`兑奖机要 ${target} 颗星星（当前 ${pgold} 颗）`); return; }
+// "钥匙可以刷在这里"的所有格子：可走到、空地、不在金库里、不贴蛇、不是门
+// 优先只放在"已经点亮过"的格子上，避免玩家找不到
+function keyCandidates() {
+    const { reach } = bfsSafe(world);
+    const all = [], shown = [];
+    for (const i of reach) {
+        if (world[i] !== EMPTY) continue;
+        if (i === idx(px, py)) continue;
+        if (i === GOAL_DOOR) continue;
+        const x = i % W, y = (i / W) | 0;
+        if (lastVault && inVaultBox(lastVault, x, y, 0)) continue;
+        if (nearSnake(world, x, y, 1)) continue;
+        all.push(i);
+        if (seen[i]) shown.push(i);
+    }
+    if (shown.length) {
+        // 低难度：中间那颗尽量选已点亮里最靠近中心的
+        return shown;
+    }
+    return all;   // 极端情况（几乎没探索过）才退回全部可达格
+}
 
-    pgold -= target;
-    hasKey = true;
-    Sfx.eat();
+// 集齐星星后：叮铃一声 + 地图上刷出一把钥匙
+function spawnKey() {
+    if (keySpawned || gameOver) return;
+    const cells = keyCandidates();
+    if (!cells.length) return;
+
+    const mode = DIFFS[diffKey].keyMode;
+    let pos;
+    if (mode === 'center') {
+        const cx = W >> 1, cy = H >> 1;      // 低难度：地图正中
+        const want = idx(cx, cy);
+        if (cells.includes(want)) {
+            pos = want;
+        } else {
+            let best = cells[0], bd = Infinity;
+            for (const c of cells) {
+                const d = Math.abs((c % W) - cx) + Math.abs(((c / W) | 0) - cy);
+                if (d < bd) { bd = d; best = c; }
+            }
+            pos = best;
+        }
+    } else {
+        pos = cells[Math.floor(Math.random() * cells.length)];   // 中/高难度：随机
+    }
+
+    keyPos = pos;
+    keySpawned = true;
+    world[pos] = KEY;
+    Sfx.ding();
+    flashMsg('五颗星星集齐了！叮铃一声，地图上出现了一把钥匙 🔑');
+    if (mode === 'moving') startKeyTimer();   // 高难度：钥匙会随机移动
     seeAround(px, py);
     render();
-    flashMsg(`兑换成功！获得道具【钥匙】🔑 — 去门前按 F`);
+}
+
+function stopKeyTimer() {
+    if (keyTimer) { clearInterval(keyTimer); keyTimer = null; }
+}
+
+function startKeyTimer() {
+    stopKeyTimer();
+    const ms = DIFFS[diffKey].keyMoveMs || 1600;
+    keyTimer = setInterval(() => {
+        if (gameOver || hasKey || keyPos < 0) { stopKeyTimer(); return; }
+        const x = keyPos % W, y = (keyPos / W) | 0;
+        const dirs = shuffle([[1, 0], [-1, 0], [0, 1], [0, -1]]);
+        for (const [dx, dy] of dirs) {
+            const nx = x + dx, ny = y + dy;
+            if (!inb(nx, ny)) continue;
+            const ni = idx(nx, ny);
+            if (world[ni] !== EMPTY) continue;                  // 墙/木墙/星星/蛇/门
+            if (ni === idx(px, py)) continue;                   // 不走到玩家脚下
+            if (!seen[ni]) continue;                            // 只在已经点亮的地方走
+            if (ni === GOAL_DOOR) continue;
+            if (lastVault && inVaultBox(lastVault, nx, ny, 0)) continue;
+            if (nearSnake(world, nx, ny, 1)) continue;
+
+            world[keyPos] = EMPTY;
+            keyPos = ni;
+            world[ni] = KEY;
+            seeAround(px, py);
+            render();
+            return;
+        }
+        // 四周都不通就原地待着，下次再试
+    }, ms);
+}
+
+// 捡到钥匙
+function pickKey() {
+    if (keyPos < 0) return;
+    world[keyPos] = EMPTY;
+    keyPos = -1;
+    hasKey = true;
+    stopKeyTimer();
+    Sfx.ding();
+    flashMsg('拿到钥匙了！去右下角的门按 F');
+    render();
 }
 
 // 用钥匙开门 = 通关
 function useDoor() {
     if (gameOver) return;
-    if (!hasKey) { flashMsg("门锁着：先攒 5 颗星星，到兑奖机按 F 换钥匙"); return; }
+    if (!hasKey) { flashMsg("门锁着：先集齐 5 颗星星，再捡起地图上出现的钥匙"); return; }
     gameOver = true;
     stopTimer();
     stopSnakeTimer();
+    stopKeyTimer();
     Sfx.win();
+    const isNew = recordWin(elapsedMs);
     showOverlay('win', "🎉 恭喜通关！",
-        pickText(WIN_TEXTS) + "\n难度 " + DIFFS[diffKey].name + " · 收集 " + target + " 颗星星并开门 · 用时 " + formatTime(elapsedMs) + "。");
+        pickText(WIN_TEXTS) + "\n难度 " + DIFFS[diffKey].name + " · 收集 " + target + " 颗星星并开门 · 用时 " + formatTime(elapsedMs) +
+        (isNew ? "\n🏆 新纪录！" : ""));
 }
 
-// F 键：站在机器/门上 > 对着机器/门 > 对着木墙 > 身边的机器/门 > 砸木墙
+// F 键：站在门/面对门就开门，其余按原来的砸木墙逻辑
 function interact() {
     if (gameOver) return;
     const here = world[idx(px, py)];
-    if (here === MACHINE && !hasKey) return useMachine();
     if (here === DOOR) return useDoor();
 
     const fx = px + facing.dx, fy = py + facing.dy;
     const f = inb(fx, fy) ? world[idx(fx, fy)] : -1;
 
-    if (f === MACHINE) return useMachine();
     if (f === DOOR) return useDoor();
     if (f === WOOD) return useHammer();
 
-    if (nearCell(MACHINE)) return useMachine();
     if (nearCell(DOOR)) return useDoor();
     return useHammer();
 }
 
-// 键盘：WASD 移动；F 砸木墙；1/2/3 切换难度；结束后 R 重开
+// 键盘：WASD 移动；F 砸木墙/开门；1/2/3 只在开局前切难度；结束后 R 重开
 window.addEventListener('keydown', (e) => {
     Sfx.unlock();
     const key = e.key.toLowerCase();
 
-    if (key === '1') { setDifficulty('low'); return; }
-    if (key === '2') { setDifficulty('mid'); return; }
-    if (key === '3') { setDifficulty('high'); return; }
+    // 难度只能在游戏开始前改（开始后按 1/2/3 无效）
+    if (key === '1' || key === '2' || key === '3') {
+        if (started && !gameOver) return;
+        setDifficulty(key === '1' ? 'low' : key === '2' ? 'mid' : 'high');
+        return;
+    }
 
     if (key === 'r') {
         if (gameOver) newGame();
@@ -1033,6 +1287,41 @@ window.addEventListener('keydown', (e) => {
     render();
 });
 
+// ===== 个人纪录：每个难度最快通关时间 =====
+const BEST_KEY = 'cave-explorer-best-v1';
+let bests = (() => {
+    try {
+        const raw = localStorage.getItem(BEST_KEY);
+        const obj = raw ? JSON.parse(raw) : {};
+        return (obj && typeof obj === 'object') ? obj : {};
+    } catch (e) { return {}; }
+})();
+
+function saveBests() {
+    try { localStorage.setItem(BEST_KEY, JSON.stringify(bests)); } catch (e) {}
+}
+
+// 破纪录返回 true
+function recordWin(ms) {
+    const cur = bests[diffKey];
+    if (typeof cur !== 'number' || ms < cur) {
+        bests[diffKey] = ms;
+        saveBests();
+        return true;
+    }
+    return false;
+}
+
+function updateRecords() {
+    const el = document.getElementById('records');
+    if (!el) return;
+    const parts = ['low', 'mid', 'high'].map((k) => {
+        const t = bests[k];
+        return DIFFS[k].name + ': ' + (typeof t === 'number' ? formatTime(t) : '—');
+    });
+    el.textContent = '个人纪录 · ' + parts.join('  ｜  ');
+}
+
 function updateHUD() {
     const g = document.getElementById('gold');
     if (g) g.innerText = pgold;
@@ -1048,8 +1337,12 @@ function updateHUD() {
     if (v) v.textContent = VERSION;
     ['low', 'mid', 'high'].forEach((k) => {
         const b = document.getElementById('btn-' + k);
-        if (b) b.className = 'diff-btn' + (k === diffKey ? ' active' : '');
+        if (b) {
+            b.className = 'diff-btn' + (k === diffKey ? ' active' : '');
+            b.disabled = started && !gameOver;   // 开局后不能改难度
+        }
     });
+    updateRecords();
 }
 
 // ===== 玩家小人（SVG，金发小孩 + 收集星星的瓶子）=====
@@ -1186,7 +1479,7 @@ function render() {
                     if (item === WOOD) cell.classList.add('wood');
                     if (item === GOLD) { cell.classList.add('gold'); cell.innerText = '★'; }
                     if (item === SNAKE) { cell.classList.add('snake'); cell.innerText = '🐍'; }
-                    if (item === MACHINE) { cell.classList.add('machine'); cell.innerText = '🎰'; }
+                    if (item === KEY) { cell.classList.add('key'); cell.innerText = '🔑'; }
                     if (item === DOOR) { cell.classList.add('door'); cell.innerText = '🚪'; }
                 }
             }
@@ -1195,7 +1488,7 @@ function render() {
     }
 }
 
-// 难度按钮
+// 难度按钮（开局后禁用）
 ['low', 'mid', 'high'].forEach((k) => {
     const b = document.getElementById('btn-' + k);
     if (b) b.addEventListener('click', () => setDifficulty(k));

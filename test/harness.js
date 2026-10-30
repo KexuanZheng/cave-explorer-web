@@ -10,6 +10,8 @@ function fresh() {
     world = new Array(W * H).fill(0);
     seen = new Array(W * H).fill(false);
     px = 0; py = 0; pgold = 0; gameOver = false; hasKey = false; goal = null;
+    keyPos = -1; keySpawned = false; lastVault = null;
+    if (keyTimer) { clearInterval(keyTimer); keyTimer = null; }
     seeAround(0, 0);
     resetTimer();
     render();
@@ -51,15 +53,22 @@ check('2.4 s 后显示 2.4 s', timerText() === '2.4 s', timerText());
 
 console.log('[4] 胜利时冻结时间并显示用时');
 fresh();
-press('d');
+run('world[1] = 2; pgold = 4; seen.fill(true); render();'); // 右边一颗星（第 5 颗），并点亮全图
+press('d');                                 // 吃掉 → 叮铃 + 刷钥匙（计时从此开始）
 env.advance(2000);
-// 攒够 5 颗星星 → 兑奖机换钥匙 → 门前开门
-run('world[1] = 5; world[2] = 6; goal = { machine: 1, door: 2 }; px = 0; py = 0; facing = { dx: 1, dy: 0 }; pgold = 5; render();');
+check('集齐 5 颗会刷出钥匙', run('keySpawned') === true);
+check('低难度钥匙在地图正中', run('keyPos') === 10 + 6 * run('W'), String(run('keyPos')));
+check('还没捡到钥匙', run('hasKey') === false);
+
+run('world[2] = 6; px = 2; py = 1; facing = { dx: 0, dy: -1 };');
 press('f');
-check('换到钥匙', run('hasKey') === true);
-check('星星被消耗', run('pgold') === 0);
-check('换钥匙时还没赢', run('gameOver') === false);
-run('px = 2; py = 1; facing = { dx: 0, dy: -1 };');
+check('没钥匙开不了门', run('gameOver') === false);
+
+run('px = keyPos % W; py = (keyPos / W) | 0; checkNewMove();'); // 踩到钥匙
+check('捡到钥匙', run('hasKey') === true);
+check('捡钥匙不算通关', run('gameOver') === false);
+
+run('world[2] = 6; px = 2; py = 1; facing = { dx: 0, dy: -1 };');
 press('f');
 check('gameOver = true', run('gameOver') === true);
 check('计时已冻结', run('finished') === true);
